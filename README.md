@@ -1,7 +1,5 @@
 # @thinwrap/llm
 
-> ⚠️ **Work in progress (v0).** Milestone 1: the shared OpenAI-compatible chat connector across the first-class provider tier. Native adapters (Anthropic, Bedrock), embeddings, and per-connector docs are in progress. See `_bmad-output/planning-artifacts/prd-llm.md`.
-
 Unified, **zero-dependency** TypeScript facade over LLM chat-completion providers. One typed `Chat` facade; switch vendor by changing the provider id + model. Stateless, bring-your-own `fetch`, no vendor SDKs — the in-process, zero-egress complement to an LLM gateway.
 
 ## Install
