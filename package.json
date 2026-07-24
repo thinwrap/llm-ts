@@ -1,0 +1,73 @@
+{
+  "name": "@thinwrap/llm",
+  "version": "1.0.0",
+  "description": "Unified, zero-dependency TypeScript facade over LLM chat-completion (and embeddings) providers. Stateless, BYO fetch, no vendor SDKs.",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "src/providers/*/README.md"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
+  "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run build:cjs && npm run build:esm && node scripts/fix-esm-imports.mjs",
+    "build:cjs": "tsc -p tsconfig.build.json",
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "check:dist": "node scripts/check-dist.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "llm",
+    "ai",
+    "openai",
+    "anthropic",
+    "claude",
+    "gpt",
+    "chat-completions",
+    "embeddings",
+    "gateway",
+    "zero-dependency",
+    "lightweight",
+    "bring-your-own-fetch",
+    "stateless"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thinwrap/llm-ts"
+  },
+  "homepage": "https://thinwrap.dev",
+  "bugs": {
+    "url": "https://github.com/thinwrap/llm-ts/issues"
+  },
+  "author": "Dmitry Polyanovsky",
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.4"
+  }
+}

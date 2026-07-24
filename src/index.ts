@@ -1,0 +1,15 @@
+export { Chat } from './facades/chat.facade';
+export type { ChatConfig } from './facades/chat.facade';
+export { Embeddings, EMBEDDINGS_PROVIDER_IDS } from './facades/embeddings.facade';
+export type { EmbeddingsProviderId } from './facades/embeddings.facade';
+export { OpenAICompatConnector } from './providers/_shared/openai-compat.connector';
+export { OpenAICompatEmbeddingsConnector } from './providers/_shared/openai-compat.embeddings.connector';
+export { SPECS } from './providers/_shared/spec';
+export type { OpenAICompatSpec, SpecId } from './providers/_shared/spec';
+export { AnthropicConnector } from './providers/anthropic';
+export type { AnthropicConfig } from './providers/anthropic';
+export { BedrockConnector } from './providers/bedrock';
+export type { BedrockConfig } from './providers/bedrock';
+export { GeminiConnector } from './providers/gemini';
+export type { GeminiConfig } from './providers/gemini';
+export * from './types';
