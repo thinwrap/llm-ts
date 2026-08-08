@@ -259,3 +259,90 @@ describe('OpenAICompatConnector AbortSignal', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
+
+/**
+ * A host application can replace Node's process-global undici dispatcher at any
+ * time (`setGlobalDispatcher(new Agent().compose(retry(), responseError()))`),
+ * after which a non-2xx REJECTS instead of resolving to a `Response`. That is
+ * invisible to the `fetch` handed to the connector, so it is handled at the
+ * transport seam. Duck-typed here exactly as the library duck-types it.
+ */
+describe('a fetch that rejects instead of returning a non-2xx', () => {
+  function responseErrorRejection(statusCode: number, body: unknown, headers: Record<string, string> = {}) {
+    const wrapper = new TypeError('fetch failed');
+    (wrapper as { cause?: unknown }).cause = {
+      name: 'ResponseError',
+      code: 'UND_ERR_RESPONSE',
+      statusCode,
+      body,
+      headers: { 'content-type': 'application/json', ...headers },
+    };
+    return wrapper;
+  }
+
+  function rejectingFetch(err: unknown): typeof fetch {
+    return vi.fn((_url: string, _init?: RequestInit) => Promise.reject(err)) as unknown as typeof fetch;
+  }
+
+  // Rate limiting is the error an LLM caller most needs classified correctly —
+  // it is the difference between backing off and failing the request.
+  it('classifies a rejected 429 as rate_limited, not provider_unavailable', async () => {
+    const c = new OpenAICompatConnector(SPECS.openai, {
+      apiKey: 'k',
+      fetch: rejectingFetch(
+        responseErrorRejection(429, { error: { message: 'Rate limit reached' } }, { 'retry-after': '20' }),
+      ),
+    });
+    const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(429);
+    expect(err.providerCode).toBe('rate_limited');
+    expect(err.providerMessage).toContain('Rate limit reached');
+    expect(JSON.stringify(err.cause)).toContain('20');
+  });
+
+  it('classifies a rejected 401 as auth_failed', async () => {
+    const c = new OpenAICompatConnector(SPECS.openai, {
+      apiKey: 'k',
+      fetch: rejectingFetch(responseErrorRejection(401, { error: { message: 'Invalid API key' } })),
+    });
+    const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
+    expect(err.statusCode).toBe(401);
+    expect(err.providerCode).toBe('auth_failed');
+  });
+
+  it('recovers the status when retry exhaustion carries no body', async () => {
+    // undici's RequestRetryError holds `data: { count }` — retry metadata, not the
+    // response payload. Reading it as a body would fabricate one.
+    const wrapper = new TypeError('fetch failed');
+    (wrapper as { cause?: unknown }).cause = {
+      name: 'RequestRetryError',
+      code: 'UND_ERR_REQ_RETRY',
+      statusCode: 503,
+      data: { count: 3 },
+      headers: {},
+    };
+    const c = new OpenAICompatConnector(SPECS.openai, { apiKey: 'k', fetch: rejectingFetch(wrapper) });
+    const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
+    expect(err.statusCode).toBe(503);
+    expect(JSON.stringify(err.cause)).not.toContain('count');
+  });
+
+  it('still reports a genuine transport failure as provider_unavailable', async () => {
+    const netErr = new TypeError('fetch failed');
+    (netErr as { cause?: unknown }).cause = { name: 'SocketError', code: 'UND_ERR_SOCKET' };
+    const c = new OpenAICompatConnector(SPECS.openai, { apiKey: 'k', fetch: rejectingFetch(netErr) });
+    const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
+    expect(err.statusCode).toBeNull();
+    expect(err.providerCode).toBe('provider_unavailable');
+    expect(JSON.stringify(err.cause)).toContain('UND_ERR_SOCKET');
+  });
+
+  it('never surfaces a key-bearing URL from a leaky transport error', async () => {
+    const leaky = new TypeError('request to https://api.openai.com/v1/chat?api_key=sk-SECRET failed');
+    const c = new OpenAICompatConnector(SPECS.openai, { apiKey: 'sk-SECRET', fetch: rejectingFetch(leaky) });
+    const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
+    expect(JSON.stringify({ m: err.message, c: err.cause })).not.toContain('sk-SECRET');
+    expect(err.message).toBe('Network error');
+  });
+});

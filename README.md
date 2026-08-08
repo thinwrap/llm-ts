@@ -59,4 +59,44 @@ const chat = new Chat('openai', {
 
 An aborted request surfaces as a `ConnectorError` (`providerCode: 'invalid_request'`), same as every other failure.
 
+## Bring your own `fetch`
+
+Every connector takes an optional `fetch` in config — useful for tracing, mocking, proxying,
+or bounding a request (see *Timeouts & cancellation* above).
+
+### The injected `fetch` does not isolate you from the host
+
+**Contract: a non-2xx must be RETURNED as a `Response`, not thrown** — that is plain fetch
+semantics, and it is what lets each connector map the status to a `providerCode`
+(429 → `rate_limited`, 401 → `auth_failed`, …).
+
+On Node, both `globalThis.fetch` and `undici.fetch` dispatch through undici's
+*process-global* dispatcher, so whatever the application installed applies to your calls
+too — including a `responseError()` interceptor, under which a non-2xx **rejects** instead
+of resolving. The library detects that and rebuilds the `Response`, so classification
+still works. It cannot repair one thing: if the provider gzipped the error body, that
+interceptor buffers it below fetch's content-decoding and the bytes are destroyed before
+any library sees them, so the vendor's message is lost.
+
+To make your calls genuinely independent of the host's configuration, pass an explicit
+dispatcher instead of relying on the global one:
+
+```ts
+import { Agent, fetch as undiciFetch } from 'undici';
+
+const isolated = new Agent();                      // no inherited interceptors
+const fetchImpl = ((url, init) =>
+  undiciFetch(url as string, { ...init, dispatcher: isolated })) as typeof fetch;
+```
+
+## Security
+
+Report vulnerabilities **privately** — please do not open a public issue. Preferred: a
+[private security advisory](https://github.com/thinwrap/llm-ts/security/advisories/new)
+on this repository. Alternatively, email **security@thinwrap.dev**. Include the affected
+versions and a minimal reproduction if you have one.
+
+A vulnerability in a *provider's* own API or service belongs to that vendor rather than
+to this wrapper — please report those upstream.
+
 MIT © Dmitry Polyanovsky

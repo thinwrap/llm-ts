@@ -37,6 +37,14 @@ export abstract class BaseConnector {
     try {
       return await this.fetchImpl(url, init);
     } catch (err) {
+      // The provider may have answered and the dispatcher turned that answer
+      // into a rejection. Rebuilding the `Response` — rather than classifying
+      // here — keeps the per-connector `mapVendorError` the single owner of
+      // status→code translation. Without it a 429 reads as `provider_unavailable`
+      // with a null status, which is the single most consequential misreport an
+      // LLM caller can get.
+      const rebuilt = responseFromThrownHttpError(err);
+      if (rebuilt !== null) return rebuilt;
       throw transportErrorFrom(err);
     }
   }
@@ -69,27 +77,174 @@ export abstract class BaseConnector {
  * before the first byte — never a raw `TypeError`/`DOMException`.
  *
  * A manual `AbortController.abort()` raises an `AbortError` (consumer cancelled
- * → `invalid_request`); `AbortSignal.timeout()` raises a distinct `TimeoutError`
- * (the provider failed to respond in time → `provider_unavailable`). Any other
- * rejection (network reset, DNS) is `provider_unavailable`.
+ * → `invalid_request`); any other rejection (network reset, DNS, timeout) is
+ * `provider_unavailable`.
+ *
+ * Neither the raw message nor the raw error object is propagated: a BYO
+ * `fetchImpl` (and undici itself) can embed the request URL in its message, and
+ * for query-key providers that URL **is** the credential. Surfacing it would
+ * re-expose the secret through `error.message`, `error.cause` and every logger
+ * that serializes them (CWE-532). The PHP sibling has always used a fixed
+ * message here; this brings TypeScript in line.
  */
 export function transportErrorFrom(err: unknown): ConnectorError {
   if (err instanceof ConnectorError) return err;
   const name = (err as Error)?.name;
   if (name === 'AbortError') {
     return new ConnectorError({
-      message: (err as Error).message || 'Request cancelled',
+      message: 'Request cancelled',
       statusCode: null,
       providerCode: 'invalid_request',
-      cause: { raw: err },
+      cause: { raw: sanitizeThrownError(err) },
     });
   }
   return new ConnectorError({
-    message: (err as Error)?.message || 'Network error',
+    message: 'Network error',
     statusCode: null,
     providerCode: 'provider_unavailable',
-    cause: { raw: err },
+    cause: { raw: sanitizeThrownError(err) },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Transport-rejection normalization (duck-typed; never an `undici` import)
+// ---------------------------------------------------------------------------
+
+/** Walk `err`, `err.cause`, `err.cause.cause` — deep enough for a wrapped rejection. */
+function* errorChain(err: unknown, depth = 3): Generator<Record<string, unknown>> {
+  let current = err;
+  for (let i = 0; i < depth; i++) {
+    if (current === null || typeof current !== 'object') return;
+    yield current as Record<string, unknown>;
+    current = (current as { cause?: unknown }).cause;
+  }
+}
+
+/**
+ * Rebuild a `Response` from a rejection carrying an HTTP status, or `null` when
+ * the rejection is a genuine transport failure.
+ *
+ * Fetch resolves a non-2xx; a dispatcher may reject instead. On Node,
+ * `globalThis.fetch` runs through undici's **process-global** dispatcher, which
+ * the host application can replace at any time — `setGlobalDispatcher(new
+ * Agent().compose(retry(), interceptors.responseError()))` is ordinary app code
+ * — with no signal reaching this library. Under it, `fetch` rejects with
+ * `TypeError: fetch failed` whose `.cause` carries `statusCode`/`headers`/`body`.
+ *
+ * Only `body` is read as a body. undici's retry-exhaustion error carries a
+ * `data` field that holds `{ count }` retry metadata, NOT the response payload;
+ * treating it as one would fabricate a body the provider never sent.
+ */
+function responseFromThrownHttpError(err: unknown): Response | null {
+  if (typeof Response !== 'function') return null;
+
+  for (const link of errorChain(err)) {
+    const status = link.statusCode ?? link.status;
+    if (typeof status !== 'number' || !Number.isInteger(status) || status < 200 || status > 599) {
+      continue;
+    }
+    // 204/205/304 are null-body statuses; `new Response(body, …)` throws for them.
+    const body = status === 204 || status === 205 || status === 304 ? null : readErrorBody(link.body, link.headers);
+    try {
+      return new Response(body, { status, headers: readErrorHeaders(link.headers) });
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize a buffered error body to something the `Response` constructor accepts.
+ *
+ * A `content-encoding` on the error means the body was buffered **still
+ * compressed** and is unrecoverable — drop it rather than hand a connector
+ * mojibake. A dispatcher-level interceptor sits *below* fetch's content-decoding,
+ * so it buffers raw wire bytes and text-decodes them; gzip is not valid UTF-8, so
+ * every invalid byte becomes U+FFFD before we ever see the value. Measured on a
+ * real gzipped 400: 16 of 66 bytes replaced, the `1f 8b` magic destroyed, and
+ * re-encoding as latin1/binary/utf8 all fail to inflate (`Z_DATA_ERROR`). There
+ * is nothing here to salvage — not with `zlib`, not with anything.
+ *
+ * (Verified against undici 8.9: this is driven by `content-encoding`, not by the
+ * `;charset=` suffix — its content-type check is a prefix match. Its own
+ * `decompress()` interceptor does not help in any composition order.)
+ */
+function readErrorBody(body: unknown, headers: unknown): string | Uint8Array | ArrayBuffer | null {
+  if (typeof body === 'string') return isContentEncoded(headers) ? null : body;
+  if (body instanceof Uint8Array || body instanceof ArrayBuffer) return body;
+  if (body === null || body === undefined) return null;
+  if (typeof body === 'object') {
+    // Already-decoded JSON (undici parses `application/json` before throwing).
+    try {
+      return JSON.stringify(body);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Whether the error's headers declare a body encoding other than `identity`. */
+function isContentEncoded(headers: unknown): boolean {
+  if (headers === null || typeof headers !== 'object') return false;
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() !== 'content-encoding') continue;
+    const encoding = (Array.isArray(value) ? value.join(',') : String(value)).trim().toLowerCase();
+    return encoding !== '' && encoding !== 'identity';
+  }
+  return false;
+}
+
+/**
+ * Copy the string-valued headers off a thrown error. `content-length` and
+ * `content-encoding` are dropped: they describe a wire encoding that no longer
+ * applies once the body has been decoded and re-serialized.
+ */
+function readErrorHeaders(headers: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (headers === null || typeof headers !== 'object') return out;
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    const name = key.toLowerCase();
+    if (name === 'content-length' || name === 'content-encoding') continue;
+    if (typeof value === 'string') out[name] = value;
+    else if (Array.isArray(value) && value.every((v) => typeof v === 'string')) {
+      out[name] = value.join(', ');
+    }
+  }
+  return out;
+}
+
+/**
+ * A diagnostic-code shape: identifier characters only. A credential would reach
+ * here inside a URL, which cannot match this pattern (no `/`, `:`, `?`, `=` or
+ * whitespace). Length-capped so an opaque token cannot masquerade as one.
+ */
+const DIAGNOSTIC_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+function readDiagnosticCode(value: unknown): string | undefined {
+  return typeof value === 'string' && DIAGNOSTIC_CODE.test(value) ? value : undefined;
+}
+
+/**
+ * The non-secret, structured fields of a transport rejection. `name` alone is
+ * `'TypeError'` for every undici failure — DNS, reset, TLS — and identifies
+ * nothing; `code` (`ECONNRESET`, `UND_ERR_SOCKET`, …) is the field that names it.
+ */
+function sanitizeThrownError(err: unknown): Record<string, unknown> {
+  const raw: Record<string, unknown> = { name: (err as Error)?.name };
+  const [self, cause] = [...errorChain(err, 2)];
+
+  const code = readDiagnosticCode(self?.code) ?? readDiagnosticCode(cause?.code);
+  if (code !== undefined) raw.code = code;
+
+  const causeName = readDiagnosticCode(cause?.name);
+  if (causeName !== undefined) raw.causeName = causeName;
+
+  const statusCode = cause?.statusCode ?? self?.statusCode;
+  if (typeof statusCode === 'number') raw.statusCode = statusCode;
+
+  return raw;
 }
 
 /**

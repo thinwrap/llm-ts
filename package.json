@@ -1,6 +1,6 @@
 {
   "name": "@thinwrap/llm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Unified, zero-dependency TypeScript facade over LLM chat-completion (and embeddings) providers. Stateless, BYO fetch, no vendor SDKs.",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
