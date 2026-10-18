@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # Version-update PRs are off; security updates still run and still honour
+    # the ignore rules below.
+    open-pull-requests-limit: 0
+    ignore:
+      # vitest/vite majors raise the Node floor past the CI matrix (vitest 5
+      # needs Node 22) and peer-conflict with each other, so their PRs fail
+      # `npm ci` with ERESOLVE. Majors move by hand, together. A `versions`
+      # range (unlike `update-types`, which filters version updates only) also
+      # holds back security-update PRs that jump a major.
+      - dependency-name: vitest
+        versions: ['>=4.0.0']
+      - dependency-name: '@vitest/*'
+        versions: ['>=4.0.0']
+      - dependency-name: vite
+        versions: ['>=7.0.0']

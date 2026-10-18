@@ -17,6 +17,10 @@ function mockFetch(factory: () => Response) {
 
 const asFetch = (m: ReturnType<typeof mockFetch>): typeof fetch => m as unknown as typeof fetch;
 
+const expectedFailure = (): never => {
+  throw new Error('expected the call to fail with a ConnectorError');
+};
+
 const creds = { region: 'us-east-1', accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret' };
 
 describe('BedrockConnector.complete', () => {
@@ -30,7 +34,7 @@ describe('BedrockConnector.complete', () => {
     );
     const c = new BedrockConnector({ ...creds, fetch: asFetch(fetchMock) });
     const input: ChatInput = {
-      model: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+      model: 'amazon.nova-pro-v1:0',
       maxOutputTokens: 50,
       messages: [
         { role: 'system', content: 'be brief' },
@@ -47,7 +51,7 @@ describe('BedrockConnector.complete', () => {
     // WIRE path is single-encoded (colon → %3A); the SigV4 canonical path is
     // DOUBLE-encoded — proven in the dedicated regression test below.
     expect(call[0]).toBe(
-      'https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse',
+      'https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-pro-v1%3A0/converse',
     );
     const init = call[1]!;
     const headers = init.headers as Record<string, string>;
@@ -125,7 +129,7 @@ describe('BedrockConnector.complete', () => {
   });
 
   it('SigV4 signs the DOUBLE-encoded canonical path for a colon-bearing model id (wire stays single-encoded)', async () => {
-    const model = 'anthropic.claude-3-5-sonnet-20241022-v2:0'; // on-demand id → contains `:`
+    const model = 'amazon.nova-pro-v1:0'; // on-demand id → contains `:`
     const fetchMock = mockFetch(() =>
       jsonResponse(200, { output: { message: { content: [{ text: 'ok' }] } }, stopReason: 'end_turn', usage: {} }),
     );
@@ -141,7 +145,7 @@ describe('BedrockConnector.complete', () => {
     const serializedBody = init.body as string;
 
     // The WIRE URL is single-encoded (`%3A`), never double-encoded.
-    expect(url).toContain('/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse');
+    expect(url).toContain('/model/amazon.nova-pro-v1%3A0/converse');
     expect(url).not.toContain('%253A');
 
     // Re-sign with the same captured inputs (real signer) for BOTH encodings and
@@ -171,7 +175,7 @@ describe('BedrockConnector.complete', () => {
     const doubleSig = sigOf(signAwsRequest({ ...signerArgs, path: doublePath }).Authorization);
 
     expect(connectorSig).toBe(doubleSig); // signed the double-encoded canonical path
-    expect(connectorSig).not.toBe(singleSig); // NOT the single-encoded wire path (the old bug)
+    expect(connectorSig).not.toBe(singleSig); // NOT the single-encoded wire path
   });
 
   it('signs a colon-free model id identically whether single- or double-encoded (no regression)', async () => {
@@ -196,7 +200,7 @@ describe('BedrockConnector construction', () => {
   });
 });
 
-describe('BedrockConnector.stream (v1 non-incremental fallback)', () => {
+describe('BedrockConnector.stream (non-incremental)', () => {
   it('yields the Converse result as content + finish + usage deltas', async () => {
     const fetchMock = mockFetch(() =>
       jsonResponse(200, {
@@ -229,5 +233,198 @@ describe('Chat facade → bedrock dispatch', () => {
     const res = await chat.complete({ model: 'm', messages: [{ role: 'user', content: 'hi' }] });
     expect(res.message.content).toBe('ok');
     expect(fetchMock.mock.calls[0]![0]).toContain('bedrock-runtime.us-east-1.amazonaws.com');
+  });
+});
+
+describe('BedrockConnector 2xx without output', () => {
+  it.each([[{}], [{ stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } }]])(
+    'raises the empty-body error for %j',
+    async (body) => {
+      const c = new BedrockConnector({ ...creds, fetch: asFetch(mockFetch(() => jsonResponse(200, body))) });
+      const err = (await c
+        .complete({ model: 'amazon.nova-lite-v1:0', messages: [{ role: 'user', content: 'x' }] })
+        .catch((e: unknown) => e)) as ConnectorError;
+      expect(err).toBeInstanceOf(ConnectorError);
+      expect(err.statusCode).toBe(200);
+      expect(err.providerCode).toBe('provider_unavailable');
+    },
+  );
+});
+
+const okConverse = () =>
+  jsonResponse(200, { output: { message: { content: [{ text: 'ok' }] } }, stopReason: 'end_turn', usage: {} });
+
+describe('BedrockConnector toolChoice none', () => {
+  it('omits toolConfig entirely so the model is offered no tools', async () => {
+    const fetchMock = mockFetch(okConverse);
+    await new BedrockConnector({ ...creds, fetch: asFetch(fetchMock) }).complete({
+      model: 'amazon.nova-pro-v1:0',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object' } } }],
+      toolChoice: 'none',
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body).not.toHaveProperty('toolConfig');
+  });
+});
+
+describe('BedrockConnector SigV4 header merge', () => {
+  it('keeps one entry per header name whatever the casing, and signs the value it sends', async () => {
+    const fetchMock = mockFetch(okConverse);
+    await new BedrockConnector({
+      ...creds,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      fetch: asFetch(fetchMock),
+    }).complete({
+      model: 'amazon.nova-pro-v1:0',
+      messages: [{ role: 'user', content: 'hi' }],
+      _passthrough: { headers: { 'CONTENT-TYPE': 'application/json', host: 'ignored.example' } },
+    });
+    const init = fetchMock.mock.calls[0]![1]!;
+    const headers = init.headers as Record<string, string>;
+    const names = Object.keys(headers).map((n) => n.toLowerCase());
+    expect(names.filter((n) => n === 'content-type')).toHaveLength(1);
+    expect(names.filter((n) => n === 'host')).toHaveLength(1);
+    const contentType = Object.entries(headers).find(([n]) => n.toLowerCase() === 'content-type')![1];
+    expect(contentType).toBe('application/json');
+    expect(Object.entries(headers).find(([n]) => n.toLowerCase() === 'host')![1]).toBe('bedrock-runtime.us-east-1.amazonaws.com');
+
+    // Re-signing with exactly what went on the wire reproduces the signature.
+    const resigned = signAwsRequest({
+      method: 'POST',
+      path: `/model/${encodeURIComponent(encodeURIComponent('amazon.nova-pro-v1:0'))}/converse`,
+      service: 'bedrock',
+      region: creds.region,
+      host: 'bedrock-runtime.us-east-1.amazonaws.com',
+      accessKeyId: creds.accessKeyId,
+      secretAccessKey: creds.secretAccessKey,
+      serializedBody: init.body as string,
+      additionalSignedHeaders: { 'CONTENT-TYPE': contentType },
+      isoTimestamp: headers['X-Amz-Date']!,
+    });
+    expect(headers.Authorization).toBe(resigned.Authorization);
+  });
+});
+
+describe('BedrockConnector region validation', () => {
+  it.each(['us-east-1', 'eu-central-2', 'us-gov-west-1'])('accepts %s', (region) => {
+    expect(() => new BedrockConnector({ ...creds, region })).not.toThrow();
+  });
+
+  it.each(['attacker.example#', 'us-east-1.evil.example/x?', 'US-EAST-1', '', 'us east 1'])(
+    'rejects %j before any request can be signed to another host',
+    (region) => {
+      expect(() => new BedrockConnector({ ...creds, region })).toThrow(ConnectorError);
+    },
+  );
+});
+
+describe('BedrockConnector usage and finish reasons', () => {
+  it('folds cache reads and writes into inputTokens', async () => {
+    const c = new BedrockConnector({
+      ...creds,
+      fetch: asFetch(
+        mockFetch(() =>
+          jsonResponse(200, {
+            output: { message: { content: [{ text: 'ok' }] } },
+            stopReason: 'end_turn',
+            usage: { inputTokens: 4, outputTokens: 50, totalTokens: 1554, cacheReadInputTokens: 1500, cacheWriteInputTokens: 0 },
+          }),
+        ),
+      ),
+    });
+    const res = await c.complete({ model: 'm', messages: [{ role: 'user', content: 'x' }] });
+    expect(res.usage).toEqual({ inputTokens: 1504, outputTokens: 50, totalTokens: 1554 });
+  });
+
+  it.each([
+    ['model_context_window_exceeded', 'length'],
+    ['malformed_tool_use', 'unknown'],
+    ['malformed_model_output', 'unknown'],
+  ])('maps stopReason %s → %s', async (stopReason, expected) => {
+    const c = new BedrockConnector({
+      ...creds,
+      fetch: asFetch(mockFetch(() => jsonResponse(200, { output: { message: { content: [{ text: 'x' }] } }, stopReason, usage: {} }))),
+    });
+    expect((await c.complete({ model: 'm', messages: [{ role: 'user', content: 'x' }] })).finishReason).toBe(expected);
+  });
+});
+
+describe('BedrockConnector error classification', () => {
+  const fail = (status: number, body: unknown, headers?: Record<string, string>) =>
+    new BedrockConnector({ ...creds, fetch: asFetch(mockFetch(() => jsonResponse(status, body, headers))) })
+      .complete({ model: 'm', messages: [{ role: 'user', content: 'x' }] })
+      .then(expectedFailure, (e: unknown) => e as ConnectorError);
+
+  it.each([
+    [400, 'Input is too long for requested model.', 'context_length_exceeded'],
+    [400, 'The model returned the following errors: prompt is too long: 210000 tokens > 200000 maximum', 'context_length_exceeded'],
+    [400, 'The maximum tokens you requested exceeds the model limit of 8192.', 'invalid_request'],
+    [400, 'Malformed input request: #: extraneous key [max_tokens] is not permitted', 'invalid_request'],
+    [400, 'A conversation must start with a user message.', 'invalid_request'],
+    [408, 'Model has timed out in processing the request.', 'provider_unavailable'],
+    [424, 'The model returned an error.', 'provider_unavailable'],
+  ])('maps %i "%s" → %s', async (status, message, expected) => {
+    expect((await fail(status, { message })).providerCode).toBe(expected);
+  });
+
+  it('ignores a negative Retry-After', async () => {
+    const err = await fail(429, { message: 'Too many requests' }, { 'retry-after': '-1' });
+    expect(err.providerCode).toBe('rate_limited');
+    expect((err.cause as Record<string, unknown>).retryAfterSeconds).toBeUndefined();
+  });
+});
+
+describe('BedrockConnector review-5', () => {
+  it('maps a 402 to rate_limited', async () => {
+    const err = (await new BedrockConnector({ ...creds, fetch: asFetch(mockFetch(() => jsonResponse(402, { message: 'Payment required' }))) })
+      .complete({ model: 'm', messages: [{ role: 'user', content: 'x' }] })
+      .then(expectedFailure, (e: unknown) => e as ConnectorError)) as ConnectorError;
+    expect(err.providerCode).toBe('rate_limited');
+  });
+
+  it.each([
+    ['The model returned the following errors: input length and `max_tokens` exceed context limit: 190000 + 20000 > 200000', 'context_length_exceeded'],
+    ['The context window setting is invalid', 'invalid_request'],
+  ])('classifies a 400 "%s" as %s', async (message, expected) => {
+    const err = (await new BedrockConnector({ ...creds, fetch: asFetch(mockFetch(() => jsonResponse(400, { message }))) })
+      .complete({ model: 'm', messages: [{ role: 'user', content: 'x' }] })
+      .then(expectedFailure, (e: unknown) => e as ConnectorError)) as ConnectorError;
+    expect(err.providerCode).toBe(expected);
+  });
+
+  it('signs the full request path when baseUrl carries a path prefix', async () => {
+    const fetchMock = mockFetch(okConverse);
+    const model = 'amazon.nova-pro-v1:0';
+    await new BedrockConnector({ ...creds, baseUrl: 'https://gw.example.com/bedrock/v2/', fetch: asFetch(fetchMock) }).complete({
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('https://gw.example.com/bedrock/v2/model/amazon.nova-pro-v1%3A0/converse');
+    const headers = init!.headers as Record<string, string>;
+    const expected = signAwsRequest({
+      method: 'POST',
+      path: '/bedrock/v2/model/amazon.nova-pro-v1%253A0/converse',
+      service: 'bedrock',
+      region: creds.region,
+      host: 'gw.example.com',
+      accessKeyId: creds.accessKeyId,
+      secretAccessKey: creds.secretAccessKey,
+      serializedBody: init!.body as string,
+      additionalSignedHeaders: { 'Content-Type': 'application/json' },
+      isoTimestamp: headers['X-Amz-Date']!,
+    });
+    expect(headers.Authorization).toBe(expected.Authorization);
+  });
+
+  it('drops empty text parts, which Converse rejects', async () => {
+    const fetchMock = mockFetch(okConverse);
+    await new BedrockConnector({ ...creds, fetch: asFetch(fetchMock) }).complete({
+      model: 'm',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '' }, { type: 'text', text: 'hi' }] }],
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body.messages[0].content).toEqual([{ text: 'hi' }]);
   });
 });

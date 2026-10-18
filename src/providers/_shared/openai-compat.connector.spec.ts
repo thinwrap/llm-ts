@@ -29,6 +29,10 @@ function mockFetch(factory: () => Response) {
 const asFetch = (m: ReturnType<typeof mockFetch>): typeof fetch =>
   m as unknown as typeof fetch;
 
+const expectedFailure = (): never => {
+  throw new Error('expected the call to fail with a ConnectorError');
+};
+
 describe('OpenAICompatConnector.complete', () => {
   it('maps an OpenAI chat response to ChatResult and builds the request', async () => {
     const fetchMock = mockFetch(() =>
@@ -213,7 +217,7 @@ describe('OpenAICompatConnector.stream', () => {
       })(),
     ).rejects.toMatchObject({
       name: 'ConnectorError',
-      statusCode: 503,
+      statusCode: 200, // the status the stream arrived with
       providerCode: 'provider_unavailable',
       providerMessage: 'upstream exploded',
     });
@@ -344,5 +348,271 @@ describe('a fetch that rejects instead of returning a non-2xx', () => {
     const err = (await c.complete(input).catch((e) => e)) as ConnectorError;
     expect(JSON.stringify({ m: err.message, c: err.cause })).not.toContain('sk-SECRET');
     expect(err.message).toBe('Network error');
+  });
+});
+
+describe('max output tokens field', () => {
+  const withMax: ChatInput = { ...input, maxOutputTokens: 256 };
+  const ok = () => jsonResponse(200, { choices: [{ message: { content: 'x' }, finish_reason: 'stop' }] });
+
+  it.each(['openai', 'azure-openai'] as const)(
+    'sends max_completion_tokens (never max_tokens) for %s',
+    async (id) => {
+      const fetchMock = mockFetch(ok);
+      await new OpenAICompatConnector(SPECS[id], {
+        apiKey: 'k',
+        baseUrl: 'https://res.openai.azure.com/openai/v1',
+        fetch: asFetch(fetchMock),
+      }).complete(withMax);
+      const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+      expect(body.max_completion_tokens).toBe(256);
+      expect(body).not.toHaveProperty('max_tokens');
+    },
+  );
+
+  it('keeps max_tokens for other OpenAI-compatible providers (groq)', async () => {
+    const fetchMock = mockFetch(ok);
+    await new OpenAICompatConnector(SPECS.groq, { apiKey: 'k', fetch: asFetch(fetchMock) }).complete(withMax);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body.max_tokens).toBe(256);
+    expect(body).not.toHaveProperty('max_completion_tokens');
+  });
+});
+
+describe('2xx bodies that are not a completion', () => {
+  const complete = (body: unknown) =>
+    new OpenAICompatConnector(SPECS.openrouter, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => jsonResponse(200, body))),
+    })
+      .complete(input)
+      .catch((e: unknown) => e) as Promise<ConnectorError>;
+
+  it('raises an OpenRouter 200 carrying only an error object, classified by error.code but keeping the 200', async () => {
+    const err = await complete({ error: { code: 429, message: 'Rate limit exceeded upstream' } });
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('rate_limited');
+    expect(err.message).toBe('Rate limit exceeded upstream');
+  });
+
+  it('raises an OpenRouter 200 whose choice has finish_reason "error" beside partial content', async () => {
+    const body = {
+      id: 'gen-1',
+      model: 'openai/gpt-4o',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: 'Partial ans' },
+          finish_reason: 'error',
+          error: { code: 502, message: 'Provider disconnected' },
+        },
+      ],
+    };
+    const err = await complete(body);
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('provider_unavailable');
+    expect(err.message).toBe('Provider disconnected');
+    // the partial content stays inspectable
+    expect((err.cause as Record<string, unknown>).raw).toEqual(body);
+  });
+
+  it('classifies a string error code by its name', async () => {
+    const err = await complete({ error: { code: 'server_error', message: 'boom' } });
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+
+  it('classifies an error object with no usable code or type as unknown', async () => {
+    const err = await complete({ error: { message: 'something went wrong' } });
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('unknown');
+  });
+
+  it('raises finish_reason "error" even when the choice carries no error object, as unknown', async () => {
+    const err = await complete({ choices: [{ message: { content: '' }, finish_reason: 'error' }] });
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('unknown');
+  });
+
+  it.each([[{}], [{ choices: [] }], [{ choices: null }]])('raises the empty-body error for %j', async (body) => {
+    const err = await complete(body);
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+});
+
+describe('chunk-list message content (Mistral reasoning)', () => {
+  it('returns only the text chunks of an array-shaped message.content', async () => {
+    const fetchMock = mockFetch(() =>
+      jsonResponse(200, {
+        model: 'magistral-medium-latest',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: [
+                { type: 'thinking', thinking: [{ type: 'text', text: 'Let me compute 2+2.' }] },
+                { type: 'text', text: 'The answer ' },
+                { type: 'text', text: 'is 4.' },
+              ],
+            },
+            finish_reason: 'stop',
+          },
+        ],
+      }),
+    );
+    const res = await new OpenAICompatConnector(SPECS.mistral, { apiKey: 'k', fetch: asFetch(fetchMock) }).complete(input);
+    expect(res.message.content).toBe('The answer is 4.');
+  });
+
+  it('treats a chunk list with only thinking as no content', async () => {
+    const fetchMock = mockFetch(() =>
+      jsonResponse(200, {
+        choices: [
+          {
+            message: { content: [{ type: 'thinking', thinking: [{ type: 'text', text: 'hmm' }] }] },
+            finish_reason: 'length',
+          },
+        ],
+      }),
+    );
+    const res = await new OpenAICompatConnector(SPECS.mistral, { apiKey: 'k', fetch: asFetch(fetchMock) }).complete(input);
+    expect(res.message.content).toBeNull();
+  });
+
+  it('streams only answer text across the thinking → transition → string delta phases', async () => {
+    const frames = [
+      { choices: [{ delta: { content: [{ type: 'thinking', thinking: [{ type: 'text', text: 'Thinking…' }] }] } }] },
+      {
+        choices: [
+          {
+            delta: {
+              content: [
+                { type: 'thinking', thinking: [{ type: 'text', text: ' done.' }] },
+                { type: 'text', text: 'The answer' },
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ delta: { content: ' is 4.' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+    ];
+    const sse = frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('') + 'data: [DONE]\n\n';
+    const fetchMock = mockFetch(
+      () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const deltas: ChatStreamDelta[] = [];
+    for await (const d of new OpenAICompatConnector(SPECS.mistral, { apiKey: 'k', fetch: asFetch(fetchMock) }).stream(input)) {
+      deltas.push(d);
+    }
+    expect(deltas.filter((d) => d.contentDelta !== undefined).map((d) => d.contentDelta)).toEqual(['The answer', ' is 4.']);
+    expect(deltas.some((d) => d.finishReason === 'stop')).toBe(true);
+  });
+});
+
+describe('OpenAICompatConnector stream integrity', () => {
+  const streamOf = (body: string, contentType = 'text/event-stream') =>
+    new OpenAICompatConnector(SPECS.openai, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => new Response(body, { status: 200, headers: { 'content-type': contentType } }))),
+    });
+  const drain = async (c: OpenAICompatConnector): Promise<ChatStreamDelta[]> => {
+    const out: ChatStreamDelta[] = [];
+    for await (const d of c.stream(input)) out.push(d);
+    return out;
+  };
+
+  it('raises when the body ends with neither [DONE] nor a finish_reason', async () => {
+    const sse = 'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n';
+    await expect(drain(streamOf(sse))).rejects.toMatchObject({ name: 'ConnectorError', providerCode: 'provider_unavailable' });
+  });
+
+  it('accepts a stream that ends on a finish_reason without [DONE]', async () => {
+    const sse = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n';
+    const deltas = await drain(streamOf(sse));
+    expect(deltas.some((d) => d.finishReason === 'stop')).toBe(true);
+  });
+
+  it('raises on a 2xx JSON body for a streaming request', async () => {
+    const json = JSON.stringify({ choices: [{ message: { content: 'x' }, finish_reason: 'stop' }] });
+    await expect(drain(streamOf(json, 'application/json'))).rejects.toMatchObject({
+      name: 'ConnectorError',
+      statusCode: 200,
+      providerCode: 'provider_unavailable',
+    });
+  });
+
+  it('keeps every line of a CRLF multi-line data event', async () => {
+    const sse = 'data: {"choices":[{"delta":\r\ndata: {"content":"Hi"},"finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n';
+    const deltas = await drain(streamOf(sse));
+    expect(deltas.map((d) => d.contentDelta ?? '').join('')).toBe('Hi');
+  });
+
+  it('honours the string code of a mid-stream error frame', async () => {
+    const sse = 'data: {"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}\n\n';
+    await expect(drain(streamOf(sse))).rejects.toMatchObject({ statusCode: 200, providerCode: 'rate_limited' });
+  });
+});
+
+describe('OpenAICompatConnector status classification', () => {
+  const fail = (status: number, body: unknown, headers?: Record<string, string>) =>
+    new OpenAICompatConnector(SPECS.openrouter, { apiKey: 'k', fetch: asFetch(mockFetch(() => jsonResponse(status, body, headers))) })
+      .complete(input)
+      .then(expectedFailure, (e: unknown) => e as ConnectorError);
+
+  it.each([
+    [402, { error: { code: 402, message: 'Insufficient credits' } }, 'rate_limited'],
+    [413, { error: { message: 'Request Entity Too Large' } }, 'invalid_request'],
+    [408, { error: { message: 'Request timeout' } }, 'provider_unavailable'],
+    [400, { error: { code: 'context_length_exceeded', message: 'Your input exceeds the window.' } }, 'context_length_exceeded'],
+  ])('maps %i → %s', async (status, body, expected) => {
+    expect((await fail(status, body)).providerCode).toBe(expected);
+  });
+
+  it.each([
+    ['', undefined],
+    ['-5', undefined],
+    ['abc', undefined],
+    ['7', 7],
+    ['1.5', undefined],
+  ])('reads Retry-After %j as retryAfterSeconds %j', async (header, expected) => {
+    const err = await fail(429, { error: { message: 'slow down' } }, { 'retry-after': header });
+    expect((err.cause as Record<string, unknown>).retryAfterSeconds).toBe(expected);
+  });
+});
+
+describe('OpenAICompatConnector review-5', () => {
+  it('reads a message naming both "content" and "filter" as content_filtered', async () => {
+    const err = (await new OpenAICompatConnector(SPECS["azure-openai"], {
+      apiKey: 'k',
+      baseUrl: 'https://r.openai.azure.com/openai/v1',
+      fetch: asFetch(
+        mockFetch(() =>
+          jsonResponse(400, { error: { code: 'content_filter', message: "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." } }),
+        ),
+      ),
+    })
+      .complete(input)
+      .then(expectedFailure, (e: unknown) => e as ConnectorError)) as ConnectorError;
+    expect(err.providerCode).toBe('content_filtered');
+  });
+
+  it('classifies a mid-stream error frame with no usable code or type as unknown, keeping the stream status', async () => {
+    const c = new OpenAICompatConnector(SPECS.openrouter, {
+      apiKey: 'k',
+      fetch: asFetch(
+        mockFetch(() => new Response('data: {"error":{"message":"something broke"}}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })),
+      ),
+    });
+    await expect(
+      (async () => {
+        for await (const d of c.stream(input)) void d;
+      })(),
+    ).rejects.toMatchObject({ statusCode: 200, providerCode: 'unknown', providerMessage: 'something broke' });
   });
 });

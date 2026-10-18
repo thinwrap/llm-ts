@@ -50,7 +50,7 @@ hand-rolled on `node:crypto`).
 Copy an existing `SPECS` row. Touch-points:
 
 1. **Register the id** — add it to `LLM_PROVIDER_IDS` in [`src/types/provider-id.enum.ts`](../src/types/provider-id.enum.ts).
-2. **Add the spec row** — in [`src/providers/_shared/spec.ts`](../src/providers/_shared/spec.ts): `id`, `defaultBaseUrl`, `buildAuthHeaders`, and any quirk flags (`supportsTools`, `maxTokensField`, `streamUsagePath`, `strictParams`). That's the whole connector.
+2. **Add the spec row** — in [`src/providers/_shared/spec.ts`](../src/providers/_shared/spec.ts): `id`, `defaultBaseUrl`, `buildAuthHeaders`, and any quirk flags (`supportsTools`, `maxTokensField`, `streamUsagePath`, `strictParams`, `dimensionsField`). That's the whole connector.
 3. **README** — create `src/providers/<id>/README.md` (plain Markdown that opens with its `# Title`, no metadata block — see CONVENTIONS).
 4. **Test** — add a case to `src/providers/_shared/openai-compat.connector.spec.ts` (base URL + auth + any quirk).
 

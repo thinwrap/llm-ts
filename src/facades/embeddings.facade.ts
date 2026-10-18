@@ -11,7 +11,7 @@ import type {
 
 /**
  * First-class providers that expose an OpenAI-float-shaped `/embeddings`
- * surface (FR-AI-E1). Deliberately excludes: providers with no native
+ * surface. Deliberately excludes: providers with no native
  * embeddings (deepseek, xai), quantized/non-float shapes (perplexity int8),
  * unstable coverage (groq), and the native-adapter providers (Anthropic →
  * Voyage; Bedrock/Gemini native embeddings have a different shape — a future

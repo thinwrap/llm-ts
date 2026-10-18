@@ -38,6 +38,7 @@ Create a key at <https://openrouter.ai/keys>. It is sent as `Authorization: Bear
 - Aggregator: model ids are `{provider}/{model}` (e.g. `anthropic/claude-sonnet-4.5`), with optional `:free`/`:nitro`/`:floor` suffixes.
 - Pass `HTTP-Referer` / `X-Title` via `headers` for app attribution.
 - Drops params an underlying provider lacks (unless `provider.require_parameters` is set via `_passthrough`); `n` is unsupported.
+- A failure after processing started comes back as HTTP 200 — a body with only an `error` object, or `choices[0]` with `finish_reason: "error"` and an `error` beside partial content. Both throw `ConnectorError` with `statusCode` 200 (the status the response arrived with) and a `providerCode` classified from the embedded `error.code` / `type` — a numeric code as that HTTP status, a name such as `insufficient_quota` by the chat rules, `unknown` with neither (partial content on `cause.raw`).
 
 ## Embeddings
 

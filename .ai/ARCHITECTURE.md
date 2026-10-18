@@ -36,9 +36,10 @@ IChatConnector           BaseConnector.sendPostJson / invokeFetch / parseSSEStre
 ## The normalized surface (`IChatConnector`)
 
 - **`complete(input): Promise<ChatResult>`** and **`stream(input): AsyncIterable<ChatStreamDelta>`**.
-- `ChatResult` = `{ message: { role, content, toolCalls? }, finishReason, usage: {inputTokens, outputTokens, totalTokens}, model, raw }`.
-- `ChatStreamDelta` = incremental `{ contentDelta?, toolCallDelta?, finishReason?, usage?, raw? }`, one shape regardless of wire transport (SSE / typed events / AWS event-stream / NDJSON).
-- On vendor non-2xx (and network/abort), connectors throw `ConnectorError` (`statusCode`, `providerCode` ∈ 6-value union, `providerMessage`, `cause: { raw, retryAfter?, retryAfterSeconds? }`).
+- `ChatResult` = `{ message: { role, content, toolCalls?, providerMetadata? }, finishReason, usage: {inputTokens, outputTokens, totalTokens}, model, raw }`. `usage` is billed usage: cache reads/writes in `inputTokens`, reasoning tokens in `outputTokens`, `totalTokens` their sum.
+- `ChatStreamDelta` = incremental `{ contentDelta?, toolCallDelta?, finishReason?, usage?, providerMetadata?, raw? }`, one shape regardless of wire transport (SSE / typed events / AWS event-stream / NDJSON). A stream that ends before the provider's terminal event, or a 2xx that is not an event stream, throws.
+- `providerMetadata` (on `ToolCall`, assistant `ChatMessage`, `ChatResult.message`, `toolCallDelta`, terminal delta) is opaque per-provider turn state keyed by provider id — Gemini `thoughtSignature` per tool call, Anthropic verbatim content blocks per message. A connector reads and writes only its own key and never sends another provider's to the wire.
+- On vendor non-2xx (and network/abort), connectors throw `ConnectorError` (`statusCode`, `providerCode` ∈ 7-value union, `providerMessage`, `cause: { raw, retryAfter?, retryAfterSeconds? }`).
 
 ## `id` introspection
 
@@ -55,8 +56,8 @@ CoT output, cost, rate-limit hints, audio/video — rides through `_passthrough`
 (output) and is **never emulated**.
 
 The one deliberate sub-90% carve-out is **`reasoning: { effort }`** (D2): normalized on input and
-mapped per-connector (OpenAI-style `reasoning_effort`; a thinking-token budget for
-Anthropic/Gemini). Reasoning *output* stays raw.
+mapped per-connector (OpenAI-style `reasoning_effort`; adaptive thinking + `output_config.effort` for
+Anthropic; a thinking-token budget for Gemini). Reasoning *output* stays raw.
 
 ## Baseline-exception register (single-provider wire fixes, kept local)
 
@@ -66,15 +67,15 @@ Anthropic/Gemini). Reasoning *output* stays raw.
 
 ## Native-adapter divergences (documented, translated locally)
 
-- **Anthropic** — top-level `system`, tool results coalesced into a user turn, `tool_use`↔`toolCalls`, `reasoning.effort`→`thinking.budget_tokens` (sampling dropped while thinking). No `response_format` (structured output via `_passthrough`).
-- **Bedrock** — Converse (`system[]`, `inferenceConfig`, `toolConfig`), hand-rolled SigV4. **v1 streaming is a non-incremental fallback** — `converse-stream` is AWS binary event-stream framing, not SSE; a real binary parser is a planned follow-up.
-- **Gemini** — `systemInstruction` + `contents[]/parts`, tool results keyed by function **name** (resolved from the prior tool-call id), `response_format`→`responseSchema` (Gemini honors it), real SSE streaming.
+- **Anthropic** — top-level `system`, tool results coalesced into a user turn, `tool_use`↔`toolCalls`, `reasoning.effort`→`thinking: {type: 'adaptive'}` + `output_config.effort` for every model (sampling dropped while thinking; budget-mode models use `_passthrough`), content blocks replayed verbatim from `providerMetadata.anthropic.content` when they still match the turn (text, tool ids, tool inputs); once one turn is rebuilt, every later assistant turn is rebuilt too. No `response_format` (structured output via `_passthrough`).
+- **Bedrock** — Converse (`system[]`, `inferenceConfig`, `toolConfig`), hand-rolled SigV4. **Streaming is non-incremental** — `converse-stream` is AWS binary event-stream framing, not SSE, so `stream()` makes one Converse call.
+- **Gemini** — `systemInstruction` + `contents[]/parts`, tool results keyed by function **name** (resolved from the prior tool-call id), tool schemas in `parametersJsonSchema`, `response_format`→`responseJsonSchema`, `thoughtSignature` replayed from `ToolCall.providerMetadata.gemini` (else Google's validator-skip value on the turn's first call), real SSE streaming.
 
 ## Stateless wrapper
 
 The wrapper holds no state: no caching, retries, idempotency, conversation state, or telemetry.
 Prompt caching, when a vendor supports it, is expressed by the consumer via `_passthrough`
-(cache markers) with cached-token counts surfaced in `raw`. Refreshable auth (Azure Entra, Bedrock
+(cache markers) with the cached-token split surfaced in `raw`. Refreshable auth (Azure Entra, Bedrock
 SigV4, future Vertex OAuth) is computed per request.
 
 ## Canonical shape = Chat Completions, not Responses (D1)

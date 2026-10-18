@@ -68,6 +68,62 @@ export abstract class BaseConnector {
     }
     return json;
   }
+
+  /**
+   * Guard a 2xx streaming response before reading it as SSE. A body labelled as
+   * anything but `text/event-stream` (a JSON completion from a proxy that
+   * dropped `stream: true`, an HTML gateway page) holds no events, so reading it
+   * would end the stream with nothing and no error. A missing content-type is
+   * let through; the end-of-stream check still catches an empty body.
+   */
+  protected requireEventStream(response: Response): void {
+    const contentType = response.headers.get('content-type');
+    if (contentType === null || contentType.trim() === '') return;
+    if (contentType.toLowerCase().includes('text/event-stream')) return;
+    const mediaType = contentType.split(';')[0]!.trim();
+    const message = `Provider returned a successful status with a non-SSE body (${mediaType}) for a streaming request`;
+    void response.body?.cancel().catch(() => undefined);
+    throw new ConnectorError({
+      message,
+      statusCode: response.status,
+      providerCode: 'provider_unavailable',
+      providerMessage: message,
+      cause: null,
+    });
+  }
+
+  /**
+   * The error for a stream whose body ended before the provider's terminal
+   * event. Every supported provider closes a complete stream with one, so an
+   * EOF before it is a truncated answer (dropped connection, proxy timeout),
+   * not a short one.
+   */
+  protected streamEndedEarlyError(): ConnectorError {
+    const message = 'Stream ended before the provider sent its terminal event';
+    return new ConnectorError({
+      message,
+      statusCode: null,
+      providerCode: 'provider_unavailable',
+      providerMessage: message,
+      cause: null,
+    });
+  }
+
+  /**
+   * The error for a 2xx body that decoded but lacks the payload the operation
+   * requires (`{}`, no `choices`, no `data`, …). Same taxonomy as an empty body:
+   * returning an empty "successful" result would be the same silent data loss.
+   */
+  protected missingPayloadError(status: number, body: unknown, detail: string): ConnectorError {
+    const message = `Provider returned a successful status without the expected payload (${detail})`;
+    return new ConnectorError({
+      message,
+      statusCode: status,
+      providerCode: 'provider_unavailable',
+      providerMessage: message,
+      cause: { raw: body ?? null },
+    });
+  }
 }
 
 /**
@@ -84,8 +140,7 @@ export abstract class BaseConnector {
  * `fetchImpl` (and undici itself) can embed the request URL in its message, and
  * for query-key providers that URL **is** the credential. Surfacing it would
  * re-expose the secret through `error.message`, `error.cause` and every logger
- * that serializes them (CWE-532). The PHP sibling has always used a fixed
- * message here; this brings TypeScript in line.
+ * that serializes them (CWE-532), so the message is fixed.
  */
 export function transportErrorFrom(err: unknown): ConnectorError {
   if (err instanceof ConnectorError) return err;
@@ -248,6 +303,64 @@ function sanitizeThrownError(err: unknown): Record<string, unknown> {
 }
 
 /**
+ * Copy a `Retry-After` header onto an error cause: the verbatim value on
+ * `retryAfter`, and the delay in seconds on `retryAfterSeconds` when it parses.
+ * A blank header is ignored rather than read as "retry now" (`Number('')` is 0).
+ */
+export function applyRetryAfter(cause: Record<string, unknown>, headers: Headers): void {
+  const header = headers.get('retry-after');
+  if (header === null || header.trim() === '') return;
+  cause.retryAfter = header;
+  const secs = parseRetryAfterSeconds(header);
+  if (secs !== null) cause.retryAfterSeconds = secs;
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// RFC 9110 §5.6.7 HTTP-date: IMF-fixdate, then the obsolete RFC 850 and asctime forms.
+const IMF_FIXDATE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) ([A-Z][a-z]{2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const RFC850_DATE =
+  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-([A-Z][a-z]{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
+const ASCTIME_DATE = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Z][a-z]{2}) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+
+/**
+ * Seconds to wait per a `Retry-After` value (RFC 9110 §10.2.3), or `null` when
+ * it is neither form. `delay-seconds` is a non-negative integer, so a decimal
+ * or signed value is invalid; an HTTP-date must be one of the three formats
+ * HTTP defines (a lenient date parser would read "tomorrow" or "5"), and a
+ * past date means "retry now", 0.
+ */
+export function parseRetryAfterSeconds(header: string): number | null {
+  const value = header.trim();
+  if (/^\d+$/.test(value)) return Number(value);
+  const at = parseHttpDate(value);
+  return at === null ? null : Math.max(0, Math.round((at - Date.now()) / 1000));
+}
+
+function parseHttpDate(value: string): number | null {
+  let fields: { day: string; mon: string; year: number; time: [string, string, string] };
+  let m: RegExpExecArray | null;
+  if ((m = IMF_FIXDATE.exec(value))) {
+    fields = { day: m[1]!, mon: m[2]!, year: Number(m[3]), time: [m[4]!, m[5]!, m[6]!] };
+  } else if ((m = RFC850_DATE.exec(value))) {
+    // A two-digit year more than 50 years ahead is read as the past century (RFC 9110).
+    const yy = Number(m[3]);
+    const year = 2000 + yy > new Date().getUTCFullYear() + 50 ? 1900 + yy : 2000 + yy;
+    fields = { day: m[1]!, mon: m[2]!, year, time: [m[4]!, m[5]!, m[6]!] };
+  } else if ((m = ASCTIME_DATE.exec(value))) {
+    fields = { day: m[2]!.trim(), mon: m[1]!, year: Number(m[6]), time: [m[3]!, m[4]!, m[5]!] };
+  } else {
+    return null;
+  }
+  const month = MONTHS.indexOf(fields.mon);
+  const day = Number(fields.day);
+  const [hh, mm, ss] = fields.time.map(Number) as [number, number, number];
+  if (month < 0 || hh > 23 || mm > 59 || ss > 60) return null;
+  const at = Date.UTC(fields.year, month, day, hh, mm, ss);
+  // Date.UTC rolls an impossible day ("31 Feb") into the next month; refuse it.
+  return new Date(at).getUTCDate() === day ? at : null;
+}
+
+/**
  * Append `_passthrough.query` params to a request URL. EVERY request path must
  * honor this — not just OpenAI-compat chat — because some providers require a
  * query param the facade doesn't model (e.g. Azure OpenAI's `api-version`).
@@ -268,13 +381,19 @@ export function appendPassthroughQuery(url: string, query?: Record<string, strin
  */
 const MAX_SSE_EVENT_CHARS = 16 * 1024 * 1024;
 
+/** Read-back state of one `parseSSEStream` run. */
+export interface SSEStreamState {
+  /** Set when the stream ended on the OpenAI-style `[DONE]` sentinel. */
+  sawDone: boolean;
+}
+
 /**
  * Parse a Server-Sent-Events response body into a sequence of JSON-decoded
- * `data:` payloads. Skips comments/blank lines, stops at the `[DONE]` sentinel,
- * and ignores any `data:` line that isn't valid JSON. Transport-agnostic over
- * `\n\n` and `\r\n\r\n` event boundaries.
+ * `data:` payloads. Skips comments/blank lines, stops at the `[DONE]` sentinel
+ * (recording it on `state`), and ignores any `data:` line that isn't valid
+ * JSON. Accepts CRLF, CR and LF line terminators.
  */
-export async function* parseSSEStream(response: Response): AsyncGenerator<unknown> {
+export async function* parseSSEStream(response: Response, state?: SSEStreamState): AsyncGenerator<unknown> {
   const body = response.body;
   if (!body) return;
   const reader = body.getReader();
@@ -307,6 +426,7 @@ export async function* parseSSEStream(response: Response): AsyncGenerator<unknow
           // sentinel does NOT mean the body is fully consumed — every
           // OpenAI-compat stream ends here, and without a cancel undici can't
           // release the socket (leak on every successful stream).
+          if (state) state.sawDone = true;
           return;
         }
         const parsed = tryParseJson(payload);
@@ -324,7 +444,9 @@ export async function* parseSSEStream(response: Response): AsyncGenerator<unknow
     const tail = buffer.trim();
     if (tail) {
       const payload = extractData(tail);
-      if (payload !== null && payload !== '[DONE]') {
+      if (payload === '[DONE]') {
+        if (state) state.sawDone = true;
+      } else if (payload !== null) {
         const parsed = tryParseJson(payload);
         if (parsed !== undefined) yield parsed;
       }
@@ -348,8 +470,12 @@ export async function* parseSSEStream(response: Response): AsyncGenerator<unknow
 // spec permits CRLF, CR, or LF as a terminator, so accept any pairing
 // (`\n\n`, `\r\n\r\n`, `\r\r`, and mixed `\n\r\n` / `\r\n\n`) rather than only
 // the two common forms — a CR-only or mixed upstream would otherwise never
-// split and buffer until MAX_SSE_EVENT_CHARS.
-const EVENT_BOUNDARY_RE = /(?:\r\n|\r|\n)(?:\r\n|\r|\n)/;
+// split and buffer until MAX_SSE_EVENT_CHARS. A lone CR counts only when no LF
+// follows it: the CR of a CRLF is half of ONE terminator, and reading it as a
+// terminator of its own would split every CRLF line into an event, dropping
+// all but the last line of a multi-line `data:` event.
+const LINE_END = '(?:\\r\\n|\\r(?!\\n)|\\n)';
+const EVENT_BOUNDARY_RE = new RegExp(LINE_END + LINE_END);
 
 function indexOfEventBoundary(buffer: string): number {
   const m = EVENT_BOUNDARY_RE.exec(buffer);

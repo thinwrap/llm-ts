@@ -38,6 +38,8 @@ Get the key and resource endpoint from the Azure portal. The connector sends it 
 - **`baseUrl` is required**: `https://<resource>.openai.azure.com/openai/v1` (v1 GA API, opt-in Aug 2025 — no `api-version` needed).
 - The `model` field is the per-resource **deployment name**, not a portable global model id.
 - Auth is dual-mode: `api-key` header or an Entra bearer token (supply the latter via `headers`).
+- `maxOutputTokens` is sent as `max_completion_tokens` — Azure reasoning models accept only that field on Chat Completions. The v1 API takes it; on a legacy `/openai/deployments/…?api-version=` URL it needs `api-version` `2024-09-01-preview` or later (the version that added it), and older versions reject it.
+- **Function tools + reasoning:** current models (gpt-5.4, gpt-5.4-mini, gpt-5.5, the gpt-5.6 family) reject function `tools` combined with reasoning on Chat Completions with a **400**, and gpt-5.6 does so even with `reasoning` unset. The workaround is `_passthrough: { body: { reasoning_effort: 'none' } }` (accepted on 5.4 and later; gpt-5-mini and o4-mini reject `'none'`). Tool calling with reasoning moves to the Responses API in a later release.
 
 ## Embeddings
 

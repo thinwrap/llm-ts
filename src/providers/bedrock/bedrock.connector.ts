@@ -1,5 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
-import { BaseConnector } from '../../base/base.connector';
+import { applyRetryAfter, BaseConnector } from '../../base/base.connector';
 import { ConnectorError } from '../../types';
 import type {
   ChatInput,
@@ -18,6 +18,13 @@ const DEFAULT_MAX_TOKENS = 4096;
 const SERVICE = 'bedrock';
 
 /**
+ * An AWS region is a DNS label run (`us-east-1`, `eu-central-2`). It is spliced
+ * into the default host, so anything else (`x.evil.example#`) could steer the
+ * signed request — session token included — to another host.
+ */
+const REGION_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
  * Native adapter for AWS Bedrock's unified **Converse API**
  * (`POST /model/{modelId}/converse`). Requests are signed with hand-rolled AWS
  * SigV4 on `node:crypto` (zero third-party deps — same approach as the
@@ -27,12 +34,10 @@ const SERVICE = 'bedrock';
  * layer emitting the identical normalized `ChatResult` / `ChatStreamDelta` /
  * `ConnectorError`.
  *
- * v1 streaming NOTE: Bedrock's `converse-stream` uses AWS's binary
- * event-stream framing (`application/vnd.amazon.eventstream`), not SSE. v1 does
- * NOT parse that binary protocol — `stream()` falls back to a single
- * non-incremental Converse call and yields the full result as deltas. True
- * incremental streaming (a binary event-stream parser) is a documented
- * follow-up.
+ * Streaming NOTE: Bedrock's `converse-stream` uses AWS's binary event-stream
+ * framing (`application/vnd.amazon.eventstream`), not SSE. This connector does
+ * NOT parse that binary protocol — `stream()` makes a single non-incremental
+ * Converse call and yields the full result as deltas.
  *
  * Not normalized here (passthrough/raw, never emulated): reasoning control
  * (model-dependent on Bedrock — pass `additionalModelRequestFields` via
@@ -44,16 +49,34 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
   private readonly config: BedrockConfig;
   private readonly origin: string;
   private readonly host: string;
+  /** The `baseUrl` path prefix (e.g. a gateway's `/bedrock`), `''` for none, as signed. */
+  private readonly canonicalBasePath: string;
 
   constructor(config: BedrockConfig) {
     super(config.fetch);
+    if (typeof config.region !== 'string' || !REGION_RE.test(config.region)) {
+      throw new ConnectorError({
+        message: 'Bedrock: `region` must be an AWS region name such as `us-east-1`',
+        statusCode: null,
+        providerCode: 'invalid_request',
+      });
+    }
     this.config = config;
     this.origin = (config.baseUrl ?? `https://bedrock-runtime.${config.region}.amazonaws.com`).replace(
       /\/+$/,
       '',
     );
     try {
-      this.host = new URL(this.origin).host;
+      const origin = new URL(this.origin);
+      this.host = origin.host;
+      // A gateway `baseUrl` with a path prefix sends `<prefix>/model/…`, and the
+      // signature must cover that full path; each segment is encoded once more,
+      // like the model id below.
+      this.canonicalBasePath = origin.pathname
+        .replace(/\/+$/, '')
+        .split('/')
+        .map((segment) => encodeURIComponent(segment))
+        .join('/');
     } catch {
       throw new ConnectorError({
         message: `Bedrock: invalid \`baseUrl\`/\`region\` — could not derive a host from '${this.origin}'`,
@@ -73,7 +96,7 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
     // server's signature never matches ours → 403 SignatureDoesNotMatch. For a
     // colon-free id the two are identical, so nothing regresses.
     const wirePath = `/model/${encodeURIComponent(input.model)}/converse`;
-    const canonicalPath = `/model/${encodeURIComponent(encodeURIComponent(input.model))}/converse`;
+    const canonicalPath = `${this.canonicalBasePath}/model/${encodeURIComponent(encodeURIComponent(input.model))}/converse`;
     // `_passthrough.query` must be folded into the SigV4 canonical query BEFORE
     // signing (the query string is part of the signed canonical request); the
     // same canonical form then travels on the wire, so the server's recomputed
@@ -92,12 +115,16 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
       throw this.mapVendorError(response.status, errBody, response.headers);
     }
     const json = this.requireDecodedBody<ConverseResponse>((await response.json().catch(() => null)) as ConverseResponse | null, response.status);
+    // Converse always returns the `output` union; without it there is no message.
+    if (json.output == null || typeof json.output !== 'object') {
+      throw this.missingPayloadError(response.status, json, 'no output');
+    }
     return this.parseResult(json, input.model);
   }
 
   /**
-   * v1 fallback: non-incremental. See the class NOTE — Bedrock streaming is a
-   * binary event-stream, not SSE; v1 issues one Converse call and yields the
+   * Non-incremental: see the class NOTE — Bedrock streaming is a binary
+   * event-stream, not SSE, so this issues one Converse call and yields the
    * result as a content delta + tool-call deltas + a terminal finish/usage delta.
    */
   async *stream(input: ChatInput): AsyncGenerator<ChatStreamDelta> {
@@ -127,11 +154,14 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
     input: ChatInput,
     canonicalQuery?: string,
   ): Record<string, string> {
-    const extra: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...this.config.headers,
-      ...input._passthrough?.headers,
-    };
+    // Merged case-insensitively: a config/passthrough `content-type` beside the
+    // default `Content-Type` would otherwise reach fetch as two entries, which
+    // it joins into one comma-separated value that the signature never saw →
+    // SignatureDoesNotMatch. Later sources win (default < config < passthrough).
+    const extra: Record<string, string> = { 'Content-Type': 'application/json' };
+    for (const source of [this.config.headers, input._passthrough?.headers]) {
+      for (const [name, value] of Object.entries(source ?? {})) setHeaderCI(extra, name, value);
+    }
     const signed = signAwsRequest({
       method,
       path: canonicalPath,
@@ -146,7 +176,9 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
       isoTimestamp: isoBasicTimestamp(),
       canonicalQuery,
     });
-    return { ...extra, ...signed };
+    const headers = { ...extra };
+    for (const [name, value] of Object.entries(signed)) setHeaderCI(headers, name, value);
+    return headers;
   }
 
   private buildRequest(input: ChatInput): Record<string, unknown> {
@@ -165,7 +197,9 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
     }
     body.inferenceConfig = inferenceConfig;
 
-    if (input.tools && input.tools.length > 0) {
+    // toolChoice 'none' has no Converse counterpart, so the tools are left out
+    // entirely: offering them would let the model call one.
+    if (input.tools && input.tools.length > 0 && input.toolChoice !== 'none') {
       const toolConfig: Record<string, unknown> = {
         tools: input.tools.map((t) => ({
           toolSpec: {
@@ -179,7 +213,7 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
       if (tc) toolConfig.toolChoice = tc;
       body.toolConfig = toolConfig;
     }
-    // reasoning control is model-dependent on Bedrock → not auto-mapped in v1;
+    // Reasoning control is model-dependent on Bedrock, so it is not mapped;
     // pass `additionalModelRequestFields` via `_passthrough.body`.
 
     if (input._passthrough?.body) Object.assign(body, input._passthrough.body);
@@ -201,8 +235,11 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
         });
       }
     }
-    const inputTokens = json?.usage?.inputTokens ?? 0;
-    const outputTokens = json?.usage?.outputTokens ?? 0;
+    // Cache reads and writes are billed input but reported beside `inputTokens`.
+    const usage = json?.usage;
+    const inputTokens =
+      (usage?.inputTokens ?? 0) + (usage?.cacheReadInputTokens ?? 0) + (usage?.cacheWriteInputTokens ?? 0);
+    const outputTokens = usage?.outputTokens ?? 0;
     return {
       message: {
         role: 'assistant',
@@ -210,11 +247,7 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
       },
       finishReason: mapStopReason(json?.stopReason),
-      usage: {
-        inputTokens,
-        outputTokens,
-        totalTokens: json?.usage?.totalTokens ?? inputTokens + outputTokens,
-      },
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
       model: requestedModel,
       raw: json,
     };
@@ -223,13 +256,8 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
   private mapVendorError(status: number, body: unknown, headers: Headers): ConnectorError {
     const message = extractBedrockError(body) ?? `HTTP ${status}`;
     const providerCode = mapStatusToProviderCode(status, message);
-    const retryAfter = headers.get('retry-after');
     const cause: Record<string, unknown> = { raw: body ?? null };
-    if (retryAfter != null) {
-      cause.retryAfter = retryAfter;
-      const secs = parseRetryAfterSeconds(retryAfter);
-      if (secs != null) cause.retryAfterSeconds = secs;
-    }
+    applyRetryAfter(cause, headers);
     return new ConnectorError({
       message,
       statusCode: status,
@@ -246,7 +274,13 @@ export class BedrockConnector extends BaseConnector implements IChatConnector {
 
 interface ConverseResponse {
   stopReason?: string | null;
-  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadInputTokens?: number;
+    cacheWriteInputTokens?: number;
+  };
   output?: {
     message?: {
       content?: Array<{ text?: string; toolUse?: { toolUseId?: string; name?: string; input?: unknown } }>;
@@ -349,6 +383,15 @@ export function signAwsRequest(opts: {
   return out;
 }
 
+/** Set `headers[name] = value`, first dropping any entry whose name differs only in case. */
+function setHeaderCI(headers: Record<string, string>, name: string, value: string): void {
+  const lower = name.toLowerCase();
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === lower) delete headers[existing];
+  }
+  headers[name] = value;
+}
+
 function isoBasicTimestamp(): string {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
 }
@@ -430,7 +473,8 @@ function mapContentBlocks(m: ChatMessage): unknown[] {
   } else if (Array.isArray(m.content)) {
     for (const p of m.content) {
       if (p.type === 'text') {
-        blocks.push({ text: p.text });
+        // Converse rejects empty text blocks; an empty part carries nothing.
+        if (p.text.length > 0) blocks.push({ text: p.text });
       } else {
         blocks.push({ image: { format: imageFormat(p.mediaType), source: { bytes: p.base64 } } });
       }
@@ -460,7 +504,7 @@ function mapToolChoice(tc: ToolChoice | undefined): Record<string, unknown> | nu
   if (tc === undefined) return null;
   if (tc === 'auto') return { auto: {} };
   if (tc === 'required') return { any: {} };
-  if (tc === 'none') return null; // Bedrock has no "none"; omit toolChoice
+  if (tc === 'none') return null; // unreachable: buildRequest omits toolConfig for 'none'
   if (typeof tc === 'object' && tc.type === 'function') return { tool: { name: tc.function.name } };
   return null;
 }
@@ -471,12 +515,14 @@ function mapStopReason(sr: string | null | undefined): FinishReason {
     case 'stop_sequence':
       return 'stop';
     case 'max_tokens':
+    case 'model_context_window_exceeded':
       return 'length';
     case 'tool_use':
       return 'tool_calls';
     case 'content_filtered':
     case 'guardrail_intervened':
       return 'content_filter';
+    // malformed_model_output / malformed_tool_use: no usable output to name.
     default:
       return 'unknown';
   }
@@ -511,12 +557,20 @@ function extractBedrockError(body: unknown): string | null {
 
 function mapStatusToProviderCode(status: number, message: string): ProviderCode {
   if (status === 401 || status === 403) return 'auth_failed';
-  if (status === 429) return 'rate_limited';
-  if (status >= 500) return 'provider_unavailable';
-  if (status === 400 || status === 404 || status === 422) {
+  // 402 is credit/quota exhaustion, which OpenAI (429 insufficient_quota) and
+  // Gemini (RESOURCE_EXHAUSTED) already report as rate-limited, and
+  // @thinwrap/notifications maps Pusher Beams' 402 the same way.
+  if (status === 429 || status === 402) return 'rate_limited';
+  // 408 ModelTimeoutException and 424 ModelErrorException are failures on the
+  // model side of the call, retryable like a 5xx.
+  if (status >= 500 || status === 408 || status === 424) return 'provider_unavailable';
+  if (status >= 400) {
     const msg = message.toLowerCase();
     if (msg.includes('throttl')) return 'rate_limited';
-    if (msg.includes('too long') || msg.includes('context') || msg.includes('token') || msg.includes('max')) {
+    // Only overflow phrasings count: a looser match ("token", "max", "context")
+    // would turn ordinary ValidationExceptions (e.g. "maxTokens must be …")
+    // into overflows, and a caller that trims history on this code would loop.
+    if (status === 400 && CONTEXT_OVERFLOW_PHRASES.some((p) => msg.includes(p))) {
       return 'context_length_exceeded';
     }
     return 'invalid_request';
@@ -524,13 +578,16 @@ function mapStatusToProviderCode(status: number, message: string): ProviderCode 
   return 'unknown';
 }
 
-function parseRetryAfterSeconds(header: string): number | null {
-  const asNum = Number(header);
-  if (Number.isFinite(asNum)) return asNum;
-  const asDate = Date.parse(header);
-  if (!Number.isNaN(asDate)) {
-    const secs = Math.round((asDate - Date.now()) / 1000);
-    return secs >= 0 ? secs : 0;
-  }
-  return null;
-}
+/**
+ * Overflow wording of the ValidationException across Bedrock's model families;
+ * Bedrock relays the model provider's text ("Input is too long for requested
+ * model", Anthropic's "prompt is too long" / "… exceed context limit",
+ * Llama/Mistral's "maximum context length").
+ */
+const CONTEXT_OVERFLOW_PHRASES = [
+  'input is too long',
+  'prompt is too long',
+  'too many input tokens',
+  'maximum context length',
+  'exceed context limit',
+];

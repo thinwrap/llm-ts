@@ -14,7 +14,7 @@ const chat = new Chat('bedrock', {
   // sessionToken: process.env.AWS_SESSION_TOKEN,  // for temporary creds
 });
 const res = await chat.complete({
-  model: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+  model: 'amazon.nova-pro-v1:0',
   messages: [{ role: 'user', content: 'Say hi in one word.' }],
 });
 ```
@@ -23,10 +23,10 @@ const res = await chat.complete({
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `region` | yes | — | e.g. `us-east-1`. No environment inference. |
+| `region` | yes | — | e.g. `us-east-1`. No environment inference. Must be a region name (lowercase letters, digits, hyphens); anything else throws `ConnectorError` (`invalid_request`) at construction, since it becomes part of the signed host. |
 | `accessKeyId` / `secretAccessKey` | yes | — | SigV4 credentials. |
 | `sessionToken` | no | — | STS temporary-credential token → `X-Amz-Security-Token`. |
-| `baseUrl` | no | `https://bedrock-runtime.<region>.amazonaws.com` | Override origin (VPC endpoint / proxy). |
+| `baseUrl` | no | `https://bedrock-runtime.<region>.amazonaws.com` | Override origin (VPC endpoint / proxy). A path prefix (a gateway's `/bedrock`) is kept and signed with the rest of the path. |
 | `defaultMaxTokens` | no | `4096` | Converse `inferenceConfig.maxTokens` when `maxOutputTokens` is omitted. |
 | `fetch` | no | `globalThis.fetch` | BYO HTTP client. |
 
@@ -47,18 +47,19 @@ How the normalized shape maps:
 - **System message** → top-level `system: [{ text }]`.
 - **`role: 'tool'` messages** → `toolResult` blocks inside a `user` turn; consecutive tool messages coalesce into one turn.
 - **Assistant `toolCalls`** → `toolUse` blocks; **`tools`** → `toolConfig.tools[].toolSpec` with the JSON Schema under `inputSchema.json`.
-- **`toolChoice`** → `auto`→`{auto:{}}`, `required`→`{any:{}}`, `{function:{name}}`→`{tool:{name}}` (`none` → `toolConfig` omitted).
+- **`toolChoice`** → `auto`→`{auto:{}}`, `required`→`{any:{}}`, `{function:{name}}`→`{tool:{name}}`. `none` has no Converse counterpart, so `toolConfig` (the tools included) is omitted. Converse requires `toolConfig` whenever the history holds `toolUse` / `toolResult` blocks, so `none` after a tool loop returns the vendor's 400 (`invalid_request`); use `auto` there.
 - **Images** → `{ image: { format, source: { bytes } } }` (`format` derived from `mediaType`).
+- **Empty text parts** are dropped: Converse rejects an empty text block with a 400.
 - **Sampling** → `inferenceConfig` `{ maxTokens, temperature, topP, stopSequences }`.
-- **Usage** → Converse `usage` maps directly to `{ inputTokens, outputTokens, totalTokens }`.
-- **`stopReason`** → `finishReason` (`end_turn`/`stop_sequence`→`stop`, `max_tokens`→`length`, `tool_use`→`tool_calls`, `content_filtered`/`guardrail_intervened`→`content_filter`).
+- **Usage** → `inputTokens` = `inputTokens` + `cacheReadInputTokens` + `cacheWriteInputTokens` (cache reads and writes are billed input), `outputTokens` as reported, `totalTokens` = their sum.
+- **`stopReason`** → `finishReason` (`end_turn`/`stop_sequence`→`stop`, `max_tokens`/`model_context_window_exceeded`→`length`, `tool_use`→`tool_calls`, `content_filtered`/`guardrail_intervened`→`content_filter`, `malformed_model_output`/`malformed_tool_use`→`unknown`).
 
-v1 limitations (documented, not silent):
+Limitations (documented, not silent):
 
-- **Streaming is non-incremental in v1.** Bedrock's `converse-stream` uses AWS's binary event-stream framing (`application/vnd.amazon.eventstream`), not SSE. v1 does not parse that binary protocol — `stream()` issues one Converse call and yields the full result as deltas. A true incremental binary-event-stream parser is a planned follow-up.
+- **Streaming is non-incremental.** Bedrock's `converse-stream` uses AWS's binary event-stream framing (`application/vnd.amazon.eventstream`), not SSE. This connector does not parse that binary protocol — `stream()` issues one Converse call and yields the full result as deltas.
 - **Reasoning is not auto-mapped.** Reasoning control on Bedrock is model-dependent; pass `additionalModelRequestFields` via `_passthrough.body`.
 - **`responseFormat`** is not mapped (use tool-based structured output via `_passthrough`); **prompt caching** via `_passthrough` (`cachePoint` blocks).
-- **SigV4 signature is not yet pinned to an external cross-verified vector** (structural tests only); pinning a known AWS test vector is a follow-up, matching the notifications SES/SNS specs.
+- **SigV4 signature is not pinned to an external cross-verified vector** (structural tests only).
 
 ## Embeddings
 
@@ -66,6 +67,7 @@ Bedrock has no OpenAI-float embeddings surface (Amazon Titan embeddings are not 
 
 ## Error mapping & passthrough
 
-- `ConnectorError.providerCode`: `401/403`→`auth_failed`, `429`→`rate_limited`, `5xx`→`provider_unavailable`, `400/404/422`→`invalid_request` (or `rate_limited` for throttling, `context_length_exceeded` on context overflow). Raw body on `cause.raw`; `Retry-After` (when present) on `cause.retryAfter` / `cause.retryAfterSeconds`.
+- `ConnectorError.providerCode`: `401/403`→`auth_failed`, `429` and `402`→`rate_limited`, `5xx`, `408 ModelTimeoutException` and `424 ModelErrorException`→`provider_unavailable`, other `4xx`→`invalid_request` (or `rate_limited` for throttling; a `400` ValidationException worded as an overflow — Bedrock relays the model provider's text: "Input is too long for requested model", "prompt is too long", "too many input tokens", "maximum context length", "exceed context limit" — →`context_length_exceeded`). Raw body on `cause.raw`; a non-empty `Retry-After` on `cause.retryAfter`, with `cause.retryAfterSeconds` when it parses to a non-negative delay.
+- Headers from `config.headers` and `_passthrough.headers` are signed; names are merged case-insensitively (later source wins), so a differently-cased duplicate never reaches the wire.
 - Provider-specific request fields go through `_passthrough.body` / `.headers` / `.query`; vendor response extras stay on `ChatResult.raw`.
 - Rate-limit / quota guidance: <https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html>.

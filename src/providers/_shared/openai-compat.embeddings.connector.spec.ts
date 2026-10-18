@@ -73,3 +73,128 @@ describe('Embeddings facade', () => {
     ).toThrow(ConnectorError);
   });
 });
+
+describe('OpenAICompatEmbeddingsConnector 2xx validation', () => {
+  const create = (body: unknown, inputs: string | string[] = ['a', 'b']) =>
+    new OpenAICompatEmbeddingsConnector(SPECS.openai, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => jsonResponse(200, body))),
+    })
+      .create({ model: 'm', input: inputs })
+      .catch((e: unknown) => e) as Promise<ConnectorError>;
+
+  it('raises a 200 carrying an error object, classified by its code but keeping the 200', async () => {
+    const err = await create({ error: { code: 503, message: 'upstream down' } });
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('provider_unavailable');
+    expect(err.message).toBe('upstream down');
+  });
+
+  it.each([[{}], [{ data: null }]])('raises the empty-body error for %j', async (body) => {
+    const err = await create(body);
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+
+  it('raises when the vector count does not match the input count', async () => {
+    const err = await create({ data: [{ index: 0, embedding: [0.1, 0.2] }] });
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.providerCode).toBe('provider_unavailable');
+    expect(err.message).toContain('1 embeddings for 2 inputs');
+  });
+
+  it('counts a single string input as one', async () => {
+    const err = await create({ data: [] }, 'a');
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+
+  it.each([[null], ['0.2']])('raises on a non-numeric vector cell (%j) instead of coercing it', async (cell) => {
+    const err = await create({
+      data: [
+        { index: 0, embedding: [0.1, cell] },
+        { index: 1, embedding: [0.3, 0.4] },
+      ],
+    });
+    expect(err).toBeInstanceOf(ConnectorError);
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+
+  it('raises when a row has no embedding array', async () => {
+    const err = await create({ data: [{ index: 0 }, { index: 1, embedding: [0.3] }] });
+    expect(err.providerCode).toBe('provider_unavailable');
+  });
+});
+
+describe('OpenAICompatEmbeddingsConnector dimensions field', () => {
+  const body = { data: [{ index: 0, embedding: [0.1, 0.2] }], usage: { prompt_tokens: 1, total_tokens: 1 } };
+
+  it.each([
+    ['mistral', 'output_dimension'],
+    ['openai', 'dimensions'],
+  ] as const)('sends %s dimensions as %s', async (id, field) => {
+    const fetchMock = mockFetch(() => jsonResponse(200, body));
+    await new OpenAICompatEmbeddingsConnector(SPECS[id], { apiKey: 'k', fetch: asFetch(fetchMock) }).create({
+      model: 'm',
+      input: 'hi',
+      dimensions: 256,
+    });
+    const sent = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(sent[field]).toBe(256);
+    expect(Object.keys(sent).filter((k) => k === 'dimensions' || k === 'output_dimension')).toEqual([field]);
+  });
+
+  it('ignores a blank Retry-After instead of reading it as 0', async () => {
+    const err = (await new OpenAICompatEmbeddingsConnector(SPECS.openai, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => jsonResponse(429, { error: { message: 'slow' } }, { 'retry-after': '' }))),
+    })
+      .create({ model: 'm', input: 'hi' })
+      .catch((e: unknown) => e)) as ConnectorError;
+    expect(err.providerCode).toBe('rate_limited');
+    expect((err.cause as Record<string, unknown>).retryAfterSeconds).toBeUndefined();
+  });
+});
+
+describe('OpenAICompatEmbeddingsConnector credit exhaustion', () => {
+  it('maps a 402 to rate_limited', async () => {
+    const err = (await new OpenAICompatEmbeddingsConnector(SPECS.openrouter, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => jsonResponse(402, { error: { code: 402, message: 'Insufficient credits' } }))),
+    })
+      .create({ model: 'm', input: 'hi' })
+      .catch((e: unknown) => e)) as ConnectorError;
+    expect(err.providerCode).toBe('rate_limited');
+  });
+});
+
+describe('OpenAICompatEmbeddingsConnector in-body error names', () => {
+  it('classifies a 2xx error with a string code the way chat does', async () => {
+    const err = (await new OpenAICompatEmbeddingsConnector(SPECS.openrouter, {
+      apiKey: 'k',
+      fetch: asFetch(mockFetch(() => jsonResponse(200, { error: { code: 'insufficient_quota', message: 'quota' } }))),
+    })
+      .create({ model: 'm', input: 'hi' })
+      .catch((e: unknown) => e)) as ConnectorError;
+    expect(err.providerCode).toBe('rate_limited');
+  });
+});
+
+describe('OpenAICompatEmbeddingsConnector in-body error status', () => {
+  const create = (body: unknown) =>
+    new OpenAICompatEmbeddingsConnector(SPECS.openrouter, { apiKey: 'k', fetch: asFetch(mockFetch(() => jsonResponse(200, body))) })
+      .create({ model: 'm', input: 'hi' })
+      .catch((e: unknown) => e) as Promise<ConnectorError>;
+
+  it('keeps the 200 it arrived with when the code is a name', async () => {
+    const err = await create({ error: { code: 'insufficient_quota', message: 'quota' } });
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('rate_limited');
+  });
+
+  it('classifies an error with no usable code as unknown', async () => {
+    const err = await create({ error: { message: 'odd' } });
+    expect(err.statusCode).toBe(200);
+    expect(err.providerCode).toBe('unknown');
+  });
+});

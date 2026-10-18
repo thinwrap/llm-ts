@@ -1,4 +1,4 @@
-import { appendPassthroughQuery, BaseConnector } from '../../base/base.connector';
+import { appendPassthroughQuery, applyRetryAfter, BaseConnector } from '../../base/base.connector';
 import { ConnectorError } from '../../types';
 import type {
   EmbeddingsInput,
@@ -7,6 +7,7 @@ import type {
   OpenAICompatConfig,
   ProviderCode,
 } from '../../types';
+import { embeddedErrorStatus } from './openai-compat.connector';
 import type { OpenAICompatSpec } from './spec';
 
 /**
@@ -44,7 +45,7 @@ export class OpenAICompatEmbeddingsConnector extends BaseConnector implements IE
       input: input.input,
       encoding_format: 'float',
     };
-    if (input.dimensions !== undefined) body.dimensions = input.dimensions;
+    if (input.dimensions !== undefined) body[this.spec.dimensionsField ?? 'dimensions'] = input.dimensions;
     if (input._passthrough?.body) Object.assign(body, input._passthrough.body);
 
     const headers: Record<string, string> = {
@@ -60,32 +61,74 @@ export class OpenAICompatEmbeddingsConnector extends BaseConnector implements IE
       throw mapVendorError(response.status, errBody, response.headers);
     }
     const json = this.requireDecodedBody<EmbeddingsResponse>((await response.json().catch(() => null)) as EmbeddingsResponse | null, response.status);
-    const rows = [...(json?.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-    const inputTokens = json?.usage?.prompt_tokens ?? 0;
+    const embeddings = this.requireVectors(json, body.input, response.status, response.headers);
+    const inputTokens = json.usage?.prompt_tokens ?? 0;
     return {
-      embeddings: rows.map((d) => d.embedding ?? []),
-      usage: { inputTokens, totalTokens: json?.usage?.total_tokens ?? inputTokens },
-      model: json?.model ?? input.model,
+      embeddings,
+      usage: { inputTokens, totalTokens: json.usage?.total_tokens ?? inputTokens },
+      model: json.model ?? input.model,
       raw: json,
     };
+  }
+
+  /**
+   * Validate a 2xx body into one vector per input, in input order. A gateway
+   * can answer 200 with an `error` object, and a short or malformed `data`
+   * array would silently misalign vectors with inputs — a caller storing them
+   * by position would index the wrong text. A `null` cell is never coerced to
+   * 0 for the same reason: it would be a plausible-looking wrong vector.
+   * `sentInput` is the input actually sent (a passthrough body may replace it).
+   */
+  private requireVectors(json: EmbeddingsResponse, sentInput: unknown, status: number, headers: Headers): number[][] {
+    if (json.error != null) throw inBodyError(status, json.error, json, headers);
+    const data = json.data;
+    if (!Array.isArray(data)) throw this.missingPayloadError(status, json, 'no data');
+    const expected = Array.isArray(sentInput) ? sentInput.length : 1;
+    if (data.length !== expected) {
+      throw this.missingPayloadError(status, json, `${data.length} embeddings for ${expected} inputs`);
+    }
+    const rows = [...data].sort((a, b) => (a?.index ?? 0) - (b?.index ?? 0));
+    return rows.map((row, i) => {
+      const vector = row?.embedding;
+      if (!Array.isArray(vector) || !vector.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+        throw this.missingPayloadError(status, json, `embedding ${i} is not an array of finite numbers`);
+      }
+      return vector as number[];
+    });
   }
 }
 
 interface EmbeddingsResponse {
   model?: string;
-  data?: Array<{ index?: number; embedding?: number[] }>;
+  /** Error delivered on a 2xx by a gateway. */
+  error?: unknown;
+  data?: Array<{ index?: number; embedding?: unknown[] }>;
   usage?: { prompt_tokens?: number; total_tokens?: number };
+}
+
+/**
+ * An error inside a 2xx body keeps the status it arrived with; its code comes
+ * from the embedded error the way chat classifies it (`unknown` with no usable
+ * code or type).
+ */
+function inBodyError(httpStatus: number, error: unknown, body: unknown, headers: Headers): ConnectorError {
+  const effective = embeddedErrorStatus(error);
+  const message = extractErrorMessage(body) ?? `HTTP ${httpStatus}`;
+  const cause: Record<string, unknown> = { raw: body ?? null };
+  applyRetryAfter(cause, headers);
+  return new ConnectorError({
+    message,
+    statusCode: httpStatus,
+    providerCode: effective === null ? 'unknown' : mapStatusToProviderCode(effective),
+    providerMessage: message,
+    cause,
+  });
 }
 
 function mapVendorError(status: number, body: unknown, headers: Headers): ConnectorError {
   const message = extractErrorMessage(body) ?? `HTTP ${status}`;
   const cause: Record<string, unknown> = { raw: body ?? null };
-  const retryAfter = headers.get('retry-after');
-  if (retryAfter != null) {
-    cause.retryAfter = retryAfter;
-    const secs = Number(retryAfter);
-    if (Number.isFinite(secs)) cause.retryAfterSeconds = secs;
-  }
+  applyRetryAfter(cause, headers);
   return new ConnectorError({
     message,
     statusCode: status,
@@ -109,8 +152,12 @@ function extractErrorMessage(body: unknown): string | null {
 
 function mapStatusToProviderCode(status: number): ProviderCode {
   if (status === 401 || status === 403) return 'auth_failed';
-  if (status === 429) return 'rate_limited';
-  if (status >= 500) return 'provider_unavailable';
-  if (status === 400 || status === 404 || status === 422) return 'invalid_request';
+  // 402 is credit/quota exhaustion, which OpenAI (429 insufficient_quota) and
+  // Gemini (RESOURCE_EXHAUSTED) already report as rate-limited, and
+  // @thinwrap/notifications maps Pusher Beams' 402 the same way.
+  if (status === 429 || status === 402) return 'rate_limited';
+  if (status >= 500 || status === 408) return 'provider_unavailable';
+  // 404, 413, 422, …: the request cannot succeed as sent.
+  if (status >= 400) return 'invalid_request';
   return 'unknown';
 }

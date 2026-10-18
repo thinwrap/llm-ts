@@ -1,4 +1,5 @@
-import { BaseConnector, parseSSEStream } from '../../base/base.connector';
+import { applyRetryAfter, BaseConnector, parseSSEStream } from '../../base/base.connector';
+import type { SSEStreamState } from '../../base/base.connector';
 import { ConnectorError } from '../../types';
 import type {
   ChatInput,
@@ -52,7 +53,30 @@ export class OpenAICompatConnector extends BaseConnector implements IChatConnect
       throw this.mapVendorError(response.status, errBody, response.headers);
     }
     const json = this.requireDecodedBody<OpenAIChatResponse>((await response.json().catch(() => null)) as OpenAIChatResponse | null, response.status);
+    this.assertCompletionPayload(json, response.status, response.headers);
     return this.parseResult(json, input.model);
+  }
+
+  /**
+   * A 2xx is not proof of success. Gateways (OpenRouter documents this) answer
+   * HTTP 200 when a failure happens after processing started: the body is
+   * either only an `error` object with no `choices`, or `choices[0]` carrying
+   * `finish_reason: "error"` plus an `error` object beside partial content.
+   * Both are raised as in-body errors (see `inBodyError`).
+   */
+  private assertCompletionPayload(json: OpenAIChatResponse, status: number, headers: Headers): void {
+    if (json.error != null) {
+      throw this.inBodyError(status, json.error, json, headers);
+    }
+    const choices = json.choices;
+    if (!Array.isArray(choices) || choices.length === 0) {
+      throw this.missingPayloadError(status, json, 'no choices');
+    }
+    const choice = choices[0];
+    if (choice?.error != null || choice?.finish_reason === 'error') {
+      const error = choice?.error ?? { message: 'Provider reported finish_reason "error"' };
+      throw this.inBodyError(status, error, { error }, headers, json);
+    }
   }
 
   async *stream(input: ChatInput): AsyncGenerator<ChatStreamDelta> {
@@ -71,9 +95,18 @@ export class OpenAICompatConnector extends BaseConnector implements IChatConnect
       const errBody = await response.json().catch(() => null);
       throw this.mapVendorError(response.status, errBody, response.headers);
     }
-    for await (const chunk of parseSSEStream(response)) {
-      for (const delta of this.mapStreamChunk(chunk as OpenAIStreamChunk)) yield delta;
+    this.requireEventStream(response);
+    // A complete stream ends on `[DONE]`, and its last choice chunk carries a
+    // `finish_reason`; either one proves the answer was not cut off.
+    const state: SSEStreamState = { sawDone: false };
+    let sawFinish = false;
+    for await (const chunk of parseSSEStream(response, state)) {
+      for (const delta of this.mapStreamChunk(chunk as OpenAIStreamChunk, response.status)) {
+        if (delta.finishReason !== undefined) sawFinish = true;
+        yield delta;
+      }
     }
+    if (!state.sawDone && !sawFinish) throw this.streamEndedEarlyError();
   }
 
   private buildRequest(
@@ -135,7 +168,7 @@ export class OpenAICompatConnector extends BaseConnector implements IChatConnect
     return {
       message: {
         role: 'assistant',
-        content: msg?.content ?? null,
+        content: contentText(msg?.content),
         ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
       },
       finishReason: mapFinishReason(choice?.finish_reason),
@@ -145,19 +178,20 @@ export class OpenAICompatConnector extends BaseConnector implements IChatConnect
     };
   }
 
-  private mapStreamChunk(chunk: OpenAIStreamChunk): ChatStreamDelta[] {
+  private mapStreamChunk(chunk: OpenAIStreamChunk, httpStatus: number): ChatStreamDelta[] {
     // A provider/gateway failure emitted mid-stream arrives as an `{"error": …}`
     // data frame (no `choices`). Surface it as a ConnectorError instead of
     // silently truncating the stream into a finish-less "success".
     if (chunk.error != null) {
-      throw this.mapVendorError(streamErrorStatus(chunk.error), chunk, new Headers());
+      throw this.inBodyError(httpStatus, chunk.error, chunk, new Headers());
     }
 
     const deltas: ChatStreamDelta[] = [];
     const choice = chunk.choices?.[0];
     const delta = choice?.delta;
-    if (typeof delta?.content === 'string' && delta.content.length > 0) {
-      deltas.push({ contentDelta: delta.content, raw: chunk });
+    const contentDelta = contentText(delta?.content);
+    if (contentDelta !== null && contentDelta.length > 0) {
+      deltas.push({ contentDelta, raw: chunk });
     }
     // Parallel tool-call fragments can arrive in a single chunk — emit one
     // toolCallDelta per entry (not just `tool_calls[0]`).
@@ -191,16 +225,33 @@ export class OpenAICompatConnector extends BaseConnector implements IChatConnect
     return deltas;
   }
 
-  private mapVendorError(status: number, body: unknown, headers: Headers): ConnectorError {
+  /**
+   * An error delivered inside a 2xx body or a stream frame. It carries the HTTP
+   * status it arrived with — the response really was a 2xx — while the code
+   * comes from the embedded error: a numeric `code` classified as that HTTP
+   * status, a string `code` / `type` by its name, and `unknown` with neither.
+   * `raw` overrides `cause.raw` when `body` is only the error slice.
+   */
+  private inBodyError(httpStatus: number, error: unknown, body: unknown, headers: Headers, raw: unknown = body): ConnectorError {
+    const effective = embeddedErrorStatus(error);
+    const message = extractErrorMessage(body) ?? `HTTP ${httpStatus}`;
+    const cause: Record<string, unknown> = { raw: raw ?? null };
+    applyRetryAfter(cause, headers);
+    return new ConnectorError({
+      message,
+      statusCode: httpStatus,
+      providerCode: effective === null ? 'unknown' : mapStatusToProviderCode(effective, body),
+      providerMessage: message,
+      cause,
+    });
+  }
+
+  /** `raw` overrides `cause.raw` when `body` is only the error slice of a larger response. */
+  private mapVendorError(status: number, body: unknown, headers: Headers, raw: unknown = body): ConnectorError {
     const message = extractErrorMessage(body) ?? `HTTP ${status}`;
     const providerCode = mapStatusToProviderCode(status, body);
-    const retryAfter = headers.get('retry-after');
-    const cause: Record<string, unknown> = { raw: body ?? null };
-    if (retryAfter != null) {
-      cause.retryAfter = retryAfter;
-      const secs = parseRetryAfterSeconds(retryAfter);
-      if (secs != null) cause.retryAfterSeconds = secs;
-    }
+    const cause: Record<string, unknown> = { raw: raw ?? null };
+    applyRetryAfter(cause, headers);
     return new ConnectorError({
       message,
       statusCode: status,
@@ -221,12 +272,22 @@ interface OpenAIUsage {
   total_tokens?: number;
 }
 
+/**
+ * Mistral reasoning models return `content` as a list of chunks instead of a
+ * string: `{"type":"thinking","thinking":[…]}` and `{"type":"text","text":"…"}`.
+ */
+type OpenAIContent = string | null | Array<{ type?: string; text?: unknown }>;
+
 interface OpenAIChatResponse {
   model?: string;
   usage?: OpenAIUsage | null;
+  /** Error delivered on a 2xx (OpenRouter: failure after processing started). */
+  error?: unknown;
   choices?: Array<{
+    /** Per-choice error beside `finish_reason: "error"` and any partial content. */
+    error?: unknown;
     message?: {
-      content?: string | null;
+      content?: OpenAIContent;
       tool_calls?: Array<{
         id?: string;
         function?: { name?: string; arguments?: string };
@@ -243,7 +304,7 @@ interface OpenAIStreamChunk {
   error?: unknown;
   choices?: Array<{
     delta?: {
-      content?: string | null;
+      content?: OpenAIContent;
       tool_calls?: Array<{
         index?: number;
         id?: string;
@@ -280,6 +341,20 @@ function mapContent(content: ChatMessage['content']): unknown {
       ? { type: 'text', text: p.text }
       : { type: 'image_url', image_url: { url: `data:${p.mediaType};base64,${p.base64}` } },
   );
+}
+
+/**
+ * Answer text of a message/delta `content`. For the chunk-list shape only
+ * `type: "text"` chunks are answer text; `thinking` chunks are reasoning and
+ * stay reachable via `raw`. A list with no text is no content.
+ */
+function contentText(content: OpenAIContent | undefined): string | null {
+  if (!Array.isArray(content)) return content ?? null;
+  let text = '';
+  for (const chunk of content) {
+    if (chunk?.type === 'text' && typeof chunk.text === 'string') text += chunk.text;
+  }
+  return text.length > 0 ? text : null;
 }
 
 function mapToolCall(tc: {
@@ -345,45 +420,73 @@ function extractErrorMessage(body: unknown): string | null {
   return null;
 }
 
-/** Best-effort HTTP status for a mid-stream `{"error": …}` frame (some gateways carry a numeric `code`). */
-function streamErrorStatus(error: unknown): number {
+/** HTTP status for the OpenAI-style error `type` / `code` names an embedded error can carry instead of a number. */
+const ERROR_NAME_STATUS: Record<string, number> = {
+  invalid_request_error: 400,
+  context_length_exceeded: 400,
+  authentication_error: 401,
+  invalid_api_key: 401,
+  permission_error: 403,
+  not_found_error: 404,
+  rate_limit_error: 429,
+  rate_limit_exceeded: 429,
+  insufficient_quota: 429,
+  server_error: 500,
+  api_error: 500,
+  overloaded_error: 529,
+};
+
+/**
+ * Effective HTTP status for an `error` object delivered inside a 2xx body or a
+ * mid-stream frame: its `code` when that is an HTTP error status (a number, or
+ * a numeric string), else the status its `code` / `type` name stands for, else
+ * `null`. Shared with the embeddings connector so both classify the same body
+ * the same way.
+ */
+export function embeddedErrorStatus(error: unknown): number | null {
   if (error && typeof error === 'object') {
-    const code = (error as Record<string, unknown>).code;
-    if (typeof code === 'number' && code >= 400 && code <= 599) return code;
+    const { code, type } = error as Record<string, unknown>;
+    const numeric = typeof code === 'string' && /^\d{3}$/.test(code) ? Number(code) : code;
+    if (typeof numeric === 'number' && Number.isInteger(numeric) && numeric >= 400 && numeric <= 599) return numeric;
+    for (const name of [code, type]) {
+      if (typeof name === 'string' && ERROR_NAME_STATUS[name] !== undefined) return ERROR_NAME_STATUS[name]!;
+    }
   }
-  return 500;
+  return null;
 }
 
 function mapStatusToProviderCode(status: number, body: unknown): ProviderCode {
   if (status === 401 || status === 403) return 'auth_failed';
-  if (status === 429) return 'rate_limited';
-  if (status >= 500) return 'provider_unavailable';
-  if (status === 400 || status === 404 || status === 422) {
+  // 402 is credit/quota exhaustion, which OpenAI (429 insufficient_quota) and
+  // Gemini (RESOURCE_EXHAUSTED) already report as rate-limited, and
+  // @thinwrap/notifications maps Pusher Beams' 402 the same way.
+  if (status === 429 || status === 402) return 'rate_limited';
+  if (status >= 500 || status === 408) return 'provider_unavailable';
+  if (status >= 400) {
     const msg = (extractErrorMessage(body) ?? '').toLowerCase();
-    if (msg.includes('context length') || msg.includes('maximum context') || msg.includes('context_length')) {
+    if (
+      errorCode(body) === 'context_length_exceeded' ||
+      msg.includes('context length') ||
+      msg.includes('maximum context') ||
+      msg.includes('context_length')
+    ) {
       return 'context_length_exceeded';
     }
     if (
-      msg.includes('content_filter') ||
-      msg.includes('content filter') ||
+      (msg.includes('content') && msg.includes('filter')) ||
       msg.includes('content_policy') ||
       msg.includes('content policy') ||
       msg.includes('moderation')
     ) {
       return 'content_filtered';
     }
+    // 404, 413, 422, …: the request cannot succeed as sent.
     return 'invalid_request';
   }
   return 'unknown';
 }
 
-function parseRetryAfterSeconds(header: string): number | null {
-  const asNum = Number(header);
-  if (Number.isFinite(asNum)) return asNum;
-  const asDate = Date.parse(header);
-  if (!Number.isNaN(asDate)) {
-    const secs = Math.round((asDate - Date.now()) / 1000);
-    return secs >= 0 ? secs : 0;
-  }
-  return null;
+function errorCode(body: unknown): unknown {
+  const error = (body as { error?: unknown } | null)?.error;
+  return error && typeof error === 'object' ? (error as Record<string, unknown>).code : undefined;
 }

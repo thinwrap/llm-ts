@@ -18,7 +18,7 @@ import { Chat } from '@thinwrap/llm';
 const chat = new Chat('openai', { apiKey: process.env.OPENAI_API_KEY! });
 
 const res = await chat.complete({
-  model: 'gpt-5.6',
+  model: 'gpt-5.5',
   messages: [{ role: 'user', content: 'Say hi in one word.' }],
 });
 console.log(res.message.content, res.usage);
@@ -39,6 +39,27 @@ for await (const delta of new Chat('groq', { apiKey }).stream(input)) {
 }
 ```
 
+A stream that ends before the provider's terminal event (a dropped connection, a proxy
+timeout), or a 2xx that is not an event stream, throws `ConnectorError`
+(`provider_unavailable`) instead of ending quietly with a partial answer.
+
+## Tool loops and `providerMetadata`
+
+Some providers need opaque state from an assistant turn back on the next request: Gemini 3's
+thought signatures, Anthropic's thinking blocks. It travels on `providerMetadata`, keyed by
+provider id, on `ChatResult.message` (and on each `ToolCall`); streams carry it on
+`toolCallDelta.providerMetadata` and on the terminal delta. Pushing `result.message` back into
+`messages` as-is carries it along; if you rebuild the assistant message yourself, copy
+`providerMetadata` (message and tool calls) together with `content` and `toolCalls`. A connector
+reads only its own key, so a history survives a provider switch. Dropping it costs Anthropic
+the reasoning of that turn and of every later one; on Gemini the connector falls back to Google's documented
+signature-validator skip so the loop keeps working.
+
+## Usage
+
+`usage` counts what is billed: `inputTokens` includes cached-prompt reads and writes,
+`outputTokens` includes reasoning tokens, and `totalTokens` is their sum.
+
 ## Design
 
 Facade → connector dispatch → shared `OpenAICompatConnector` (or a native adapter). The normalized facade holds only the ≥90%-supported core; provider-specific features ride through `_passthrough` (request) / `raw` (result). See the contributor docs in `.ai/`.
@@ -57,7 +78,7 @@ const chat = new Chat('openai', {
 });
 ```
 
-An aborted request surfaces as a `ConnectorError` (`providerCode: 'invalid_request'`), same as every other failure.
+Both surface as a `ConnectorError`, like every other failure: a timeout (`AbortSignal.timeout`, a `TimeoutError`) as `providerCode: 'provider_unavailable'`, and a manual `AbortController.abort()` as `providerCode: 'invalid_request'`.
 
 ## Bring your own `fetch`
 

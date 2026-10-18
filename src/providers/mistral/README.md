@@ -37,6 +37,7 @@ Create a key at <https://console.mistral.ai/api-keys>. It is sent as `Authorizat
 
 - **Baseline-exception (handled):** Mistral 422s on unknown params, so the connector omits OpenAI-only extras like `stream_options`. Keep `_passthrough.body` to known Mistral fields.
 - Model ids are date-stamped (e.g. `-YYMM`).
+- When a model reasons (e.g. `reasoning.effort: 'high'`), Mistral returns `content` (and streamed `delta.content`) as a list of `thinking` / `text` chunks; `message.content` / `contentDelta` carry only the `text` chunks, and the thinking stays on `raw`.
 
 ## Embeddings
 
@@ -52,7 +53,7 @@ const out = await emb.create({
 });
 ```
 
-`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: 'float'`. `dimensions` maps to `dimensions` when set. Vectors are returned in input order on `out.embeddings`.
+`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: 'float'`. `dimensions` is sent as Mistral's `output_dimension` when set (honoured by models with a configurable output size). Vectors are returned in input order on `out.embeddings`.
 
 ## Error mapping & passthrough
 

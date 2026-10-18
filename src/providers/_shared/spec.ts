@@ -18,6 +18,8 @@ export interface OpenAICompatSpec {
   streamUsagePath?: 'x_groq';
   /** Mistral rejects unknown params with HTTP 422 — skip OpenAI-only extras like `stream_options`. */
   strictParams?: boolean;
+  /** Vendor field name for the embeddings output size (default `dimensions`). */
+  dimensionsField?: string;
 }
 
 const bearer = (config: OpenAICompatConfig): Record<string, string> =>
@@ -28,12 +30,17 @@ export const SPECS = {
     id: 'openai',
     defaultBaseUrl: 'https://api.openai.com/v1',
     buildAuthHeaders: bearer,
+    // `max_tokens` is deprecated and incompatible with reasoning (o-series)
+    // models; `max_completion_tokens` also bounds reasoning tokens.
+    maxTokensField: 'max_completion_tokens',
   },
   'azure-openai': {
     id: 'azure-openai',
     // no default: consumer supplies https://<resource>.openai.azure.com/openai/v1
     buildAuthHeaders: (config: OpenAICompatConfig): Record<string, string> =>
       config.apiKey ? { 'api-key': config.apiKey } : {},
+    // Azure reasoning models accept only `max_completion_tokens` on Chat Completions.
+    maxTokensField: 'max_completion_tokens',
   },
   openrouter: {
     id: 'openrouter',
@@ -71,6 +78,7 @@ export const SPECS = {
     defaultBaseUrl: 'https://api.mistral.ai/v1',
     buildAuthHeaders: bearer,
     strictParams: true,
+    dimensionsField: 'output_dimension',
   },
   perplexity: {
     id: 'perplexity',

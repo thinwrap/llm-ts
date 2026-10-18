@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSSEStream } from './base.connector';
-import { ConnectorError } from '../types';
+import { parseRetryAfterSeconds, parseSSEStream } from './base.connector';
 
 function sseResponse(body: string | ReadableStream<Uint8Array>): Response {
   return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
@@ -85,5 +84,72 @@ describe('parseSSEStream', () => {
     // break out early → generator .return() runs the finally, which must cancel
     await gen.return(undefined as never);
     expect(cancelled).toBe(true);
+  });
+});
+
+describe('parseSSEStream CRLF handling', () => {
+  it('treats a single CRLF as a line end, not an event boundary', async () => {
+    const sse = 'data: {"a":\r\ndata: 1}\r\n\r\ndata: {"b":2}\r\n\r\n';
+    const out: unknown[] = [];
+    for await (const evt of parseSSEStream(sseResponse(sse))) out.push(evt);
+    expect(out).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+
+  it('handles a CRLF split across reads', async () => {
+    const chunks = ['data: {"a":\r', '\ndata: 1}\r', '\n\r', '\ndata: {"b":2}\r\n\r\n'];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
+        controller.close();
+      },
+    });
+    const out: unknown[] = [];
+    for await (const evt of parseSSEStream(sseResponse(stream))) out.push(evt);
+    expect(out).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+
+  it('records the [DONE] sentinel on the state object', async () => {
+    const state = { sawDone: false };
+    for await (const evt of parseSSEStream(sseResponse('data: {"n":1}\n\ndata: [DONE]'), state)) void evt;
+    expect(state.sawDone).toBe(true);
+  });
+});
+
+describe('parseRetryAfterSeconds', () => {
+  it.each([
+    ['', null],
+    ['  ', null],
+    ['-1', null],
+    ['nonsense', null],
+    ['0', 0],
+    ['30', 30],
+    ['Wed, 21 Oct 2015 07:28:00 GMT', 0],
+  ])('parses %j → %j', (header, expected) => {
+    expect(parseRetryAfterSeconds(header)).toBe(expected);
+  });
+});
+
+describe('parseRetryAfterSeconds (RFC 9110 forms only)', () => {
+  it.each(['1.5', '+5', '1e3', 'tomorrow', '+1 week', '2026-10-18T10:00:00Z', 'Sun, 32 Nov 1994 08:49:37 GMT', 'Sun, 06 Nov 1994 25:49:37 GMT'])(
+    'ignores %j',
+    (header) => {
+      expect(parseRetryAfterSeconds(header)).toBeNull();
+    },
+  );
+
+  it.each(['Sun, 06 Nov 1994 08:49:37 GMT', 'Sunday, 06-Nov-94 08:49:37 GMT', 'Sun Nov  6 08:49:37 1994'])(
+    'reads the past HTTP-date %j as 0',
+    (header) => {
+      expect(parseRetryAfterSeconds(header)).toBe(0);
+    },
+  );
+
+  it('reads a future IMF-fixdate as the seconds until it', () => {
+    const at = new Date(Date.now() + 120_000);
+    at.setUTCMilliseconds(0);
+    const header = at.toUTCString();
+    const secs = parseRetryAfterSeconds(header)!;
+    expect(secs).toBeGreaterThanOrEqual(118);
+    expect(secs).toBeLessThanOrEqual(120);
   });
 });

@@ -7,7 +7,7 @@ export interface AnthropicConfig {
   anthropicVersion?: string;
   /**
    * Anthropic requires `max_tokens` on every request. Used when
-   * `ChatInput.maxOutputTokens` is omitted. Default 4096.
+   * `ChatInput.maxOutputTokens` is omitted. Default 16000.
    */
   defaultMaxTokens?: number;
   /** Bring-your-own fetch. Defaults to `globalThis.fetch`. */

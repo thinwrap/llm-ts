@@ -1,4 +1,4 @@
-import { appendPassthroughQuery, BaseConnector, parseSSEStream } from '../../base/base.connector';
+import { appendPassthroughQuery, applyRetryAfter, BaseConnector, parseSSEStream } from '../../base/base.connector';
 import { ConnectorError } from '../../types';
 import type {
   ChatInput,
@@ -18,6 +18,16 @@ import type { GeminiConfig } from './gemini.config';
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 
 /**
+ * Google's documented value for a `thoughtSignature` the client does not have
+ * (a hand-built history, or one from another provider). Gemini 3 rejects a
+ * model turn whose function calls carry no signature at all.
+ */
+const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
+/** The id this connector invents for a function call that came back without one. */
+const SYNTHETIC_CALL_ID = /^call_\d+$/;
+
+/**
  * Native adapter for the Google Gemini (AI Studio) `generateContent` API.
  * Gemini uses `contents[]`/`parts[]` (roles `user`/`model`), a top-level
  * `systemInstruction`, `functionDeclarations`, and keys tool results by
@@ -26,9 +36,13 @@ const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
  * `ConnectorError`. Unlike Bedrock, Gemini streaming IS SSE
  * (`:streamGenerateContent?alt=sse`), so streaming is truly incremental.
  *
- * Passthrough/raw (not emulated): Gemini-3 `thought_signature` round-trip and
- * reasoning CoT output (`raw`), prompt caching (`cachedContent` via
- * `_passthrough`), safety settings / video params (`_passthrough`).
+ * A function call's `thoughtSignature` travels on
+ * `ToolCall.providerMetadata.gemini` and goes back on the replayed
+ * `functionCall` part, which Gemini 3 requires in a tool loop.
+ *
+ * Passthrough/raw (not emulated): reasoning CoT output (`raw`), prompt caching
+ * (`cachedContent` via `_passthrough`), safety settings / video params
+ * (`_passthrough`).
  */
 export class GeminiConnector extends BaseConnector implements IChatConnector {
   public readonly id = 'gemini';
@@ -52,6 +66,11 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
       throw this.mapVendorError(response.status, errBody, response.headers);
     }
     const json = this.requireDecodedBody<GeminiResponse>((await response.json().catch(() => null)) as GeminiResponse | null, response.status);
+    // Only a prompt-level block legitimately omits `candidates` (parseResult
+    // turns it into content_filter); any other body without them is not a result.
+    if (!Array.isArray(json.candidates) && !json.promptFeedback?.blockReason) {
+      throw this.missingPayloadError(response.status, json, 'no candidates');
+    }
     return this.parseResult(json, input.model);
   }
 
@@ -70,6 +89,7 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
       const errBody = await response.json().catch(() => null);
       throw this.mapVendorError(response.status, errBody, response.headers);
     }
+    this.requireEventStream(response);
 
     let sawFunctionCall = false;
     // Gemini yields each functionCall part in its own chunk, so assign a
@@ -78,24 +98,25 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
     // consumer keyed on `index` merge parallel/multiple calls into one.
     let nextToolIndex = 0;
     // Gemini's `usageMetadata` is cumulative and can appear on more than one
-    // chunk. Buffer the latest and emit a SINGLE terminal `usage` delta at
-    // stream end (matching the OpenAI-compat `include_usage` trailer and
-    // Anthropic's single `message_delta`) so a consumer summing `delta.usage`
-    // across the stream never double-counts.
+    // chunk, even after the finish. Buffer the latest and report it ONCE, on
+    // the finish delta emitted at stream end, so a consumer summing
+    // `delta.usage` never double-counts and finds usage beside the finish as on
+    // every other provider.
     let latestUsage: GeminiResponse['usageMetadata'];
-    let latestUsageChunk: GeminiResponse | undefined;
+    let finish: { reason: FinishReason; chunk: GeminiResponse } | undefined;
     for await (const raw of parseSSEStream(response)) {
       const chunk = raw as GeminiResponse;
       // A provider error emitted mid-stream arrives as an `{"error": …}` frame —
       // throw instead of silently ending the stream with no finishReason.
       if (chunk.error != null) {
-        throw this.mapVendorError(errorFrameStatus(chunk.error), chunk, new Headers());
+        throw this.mapStreamErrorFrame(response.status, chunk);
       }
       // A prompt-level safety block on a stream arrives as a chunk with no
       // candidate and only promptFeedback — emit a content_filter finish so the
       // consumer sees the block instead of a silent, empty end.
       if (chunk.candidates?.[0] == null && chunk.promptFeedback?.blockReason) {
-        yield { finishReason: 'content_filter', raw: chunk };
+        finish = { reason: 'content_filter', chunk };
+        if (chunk.usageMetadata) latestUsage = chunk.usageMetadata;
         continue;
       }
       const cand = chunk.candidates?.[0];
@@ -106,29 +127,49 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
           yield { contentDelta: p.text, raw: chunk };
         } else if (p.functionCall) {
           sawFunctionCall = true;
+          const index = nextToolIndex++;
+          const providerMetadata = signatureMetadata(p);
           yield {
             toolCallDelta: {
-              index: nextToolIndex++,
-              id: p.functionCall.id ?? `call_${p.functionCall.name ?? ''}`,
+              index,
+              // Index-based, so parallel calls to one function stay distinct.
+              id: p.functionCall.id || `call_${index}`,
               functionName: p.functionCall.name,
               argumentsDelta: JSON.stringify(p.functionCall.args ?? {}),
+              ...(providerMetadata ? { providerMetadata } : {}),
             },
             raw: chunk,
           };
         }
       }
-      if (chunk.usageMetadata) {
-        latestUsage = chunk.usageMetadata;
-        latestUsageChunk = chunk;
-      }
+      if (chunk.usageMetadata) latestUsage = chunk.usageMetadata;
       if (cand?.finishReason) {
-        yield {
-          finishReason: sawFunctionCall ? 'tool_calls' : mapFinishReason(cand.finishReason),
-          raw: chunk,
-        };
+        finish = { reason: sawFunctionCall ? 'tool_calls' : mapFinishReason(cand.finishReason), chunk };
       }
     }
-    if (latestUsage) yield { usage: mapUsage(latestUsage), raw: latestUsageChunk };
+    if (!finish) throw this.streamEndedEarlyError();
+    yield {
+      finishReason: finish.reason,
+      ...(latestUsage ? { usage: mapUsage(latestUsage) } : {}),
+      raw: finish.chunk,
+    };
+  }
+
+  /**
+   * A mid-stream `{"error": …}` frame arrives inside a 200 stream, so the
+   * error carries that status; the code comes from the frame's own `code` or
+   * google.rpc `status` name, and a frame with neither is `unknown`.
+   */
+  private mapStreamErrorFrame(httpStatus: number, chunk: GeminiResponse): ConnectorError {
+    const effective = errorFrameStatus(chunk.error);
+    const message = extractGeminiError(chunk) ?? `HTTP ${httpStatus}`;
+    return new ConnectorError({
+      message,
+      statusCode: httpStatus,
+      providerCode: effective === null ? 'unknown' : mapStatusToProviderCode(effective, message, chunk),
+      providerMessage: message,
+      cause: { raw: chunk },
+    });
   }
 
   private authHeaders(input: ChatInput): Record<string, string> {
@@ -151,7 +192,9 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
           functionDeclarations: input.tools.map((t) => ({
             name: t.function.name,
             ...(t.function.description ? { description: t.function.description } : {}),
-            ...(t.function.parameters ? { parameters: t.function.parameters } : {}),
+            // `parameters` takes only Google's OpenAPI subset and 400s on plain
+            // JSON Schema (`additionalProperties`, `$ref`); this field takes it.
+            ...(t.function.parameters ? { parametersJsonSchema: t.function.parameters } : {}),
           })),
         },
       ];
@@ -189,13 +232,15 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
       } else if (typeof p.text === 'string') {
         text += p.text;
       } else if (p.functionCall) {
+        const providerMetadata = signatureMetadata(p);
         toolCalls.push({
-          id: p.functionCall.id ?? `call_${idx}`,
+          id: p.functionCall.id || `call_${idx}`,
           type: 'function',
           function: {
             name: p.functionCall.name ?? '',
             arguments: JSON.stringify(p.functionCall.args ?? {}),
           },
+          ...(providerMetadata ? { providerMetadata } : {}),
         });
         idx++;
       }
@@ -224,14 +269,9 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
 
   private mapVendorError(status: number, body: unknown, headers: Headers): ConnectorError {
     const message = extractGeminiError(body) ?? `HTTP ${status}`;
-    const providerCode = mapStatusToProviderCode(status, message);
+    const providerCode = mapStatusToProviderCode(status, message, body);
     const cause: Record<string, unknown> = { raw: body ?? null };
-    const retryAfter = headers.get('retry-after');
-    if (retryAfter != null) {
-      cause.retryAfter = retryAfter;
-      const secs = Number(retryAfter);
-      if (Number.isFinite(secs)) cause.retryAfterSeconds = secs;
-    }
+    applyRetryAfter(cause, headers);
     // Gemini has no rate-limit headers — retry timing lives in the 429 body's RetryInfo.
     if (cause.retryAfterSeconds === undefined) {
       const bodySecs = extractRetryDelaySeconds(body);
@@ -254,6 +294,8 @@ export class GeminiConnector extends BaseConnector implements IChatConnector {
 interface GeminiPart {
   text?: string;
   functionCall?: { id?: string; name?: string; args?: unknown };
+  /** Opaque reasoning-state token Gemini 3 needs back on the replayed part. */
+  thoughtSignature?: string;
   /**
    * Gemini-3 marks a reasoning/chain-of-thought part with `thought: true`. It is
    * NOT user-facing answer content — concatenating it into `content` would leak
@@ -265,7 +307,13 @@ interface GeminiPart {
 
 interface GeminiResponse {
   modelVersion?: string;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+  usageMetadata?: {
+    promptTokenCount?: number;
+    toolUsePromptTokenCount?: number;
+    candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
+    totalTokenCount?: number;
+  };
   candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string | null }>;
   /**
    * Prompt-level safety block: when the *input* is rejected, Gemini returns no
@@ -275,7 +323,7 @@ interface GeminiResponse {
    */
   promptFeedback?: { blockReason?: string | null };
   /** Mid-stream error frame: `{"error": {"code": 429, "message": …, "status": …}}`. */
-  error?: { code?: number; message?: string; status?: string };
+  error?: { code?: number | string; message?: string; status?: string };
 }
 
 type GeminiContent = { role: string; parts: unknown[] };
@@ -288,12 +336,11 @@ function splitMessages(messages: ChatMessage[]): {
   systemInstruction?: { parts: Array<{ text: string }> };
   contents: GeminiContent[];
 } {
+  // Filled while walking, so a tool result resolves against the nearest
+  // preceding assistant turn: synthetic `call_N` ids restart at 0 in every
+  // response, and a whole-history map would hand an earlier result the name
+  // of a later call.
   const nameById = new Map<string, string>();
-  for (const m of messages) {
-    if (m.role === 'assistant' && m.toolCalls) {
-      for (const tc of m.toolCalls) nameById.set(tc.id, tc.function.name);
-    }
-  }
 
   let systemText = '';
   const contents: GeminiContent[] = [];
@@ -307,7 +354,11 @@ function splitMessages(messages: ChatMessage[]): {
       const name =
         m.name ?? (m.toolCallId ? nameById.get(m.toolCallId) : undefined) ?? m.toolCallId ?? 'tool';
       const part = {
-        functionResponse: { name, response: { result: parseJsonOrString(contentToText(m.content)) } },
+        functionResponse: {
+          ...(m.toolCallId && isEchoableId(m.toolCallId) ? { id: m.toolCallId } : {}),
+          name,
+          response: { result: parseJsonOrString(contentToText(m.content)) },
+        },
       };
       const last = contents[contents.length - 1];
       if (last && last.role === 'user' && isFunctionResponseParts(last.parts)) {
@@ -316,6 +367,9 @@ function splitMessages(messages: ChatMessage[]): {
         contents.push({ role: 'user', parts: [part] });
       }
       continue;
+    }
+    if (m.role === 'assistant' && m.toolCalls) {
+      for (const tc of m.toolCalls) nameById.set(tc.id, tc.function.name);
     }
     contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts: mapParts(m) });
   }
@@ -349,12 +403,50 @@ function mapParts(m: ChatMessage): unknown[] {
     }
   }
   if (m.role === 'assistant' && m.toolCalls) {
-    for (const tc of m.toolCalls) {
-      parts.push({ functionCall: { name: tc.function.name, args: safeJsonParse(tc.function.arguments) } });
-    }
+    const signed = m.toolCalls.some((tc) => storedSignature(tc) !== undefined);
+    m.toolCalls.forEach((tc, i) => {
+      const part: Record<string, unknown> = {
+        functionCall: {
+          ...(isEchoableId(tc.id) ? { id: tc.id } : {}),
+          name: tc.function.name,
+          args: safeJsonParse(tc.function.arguments),
+        },
+      };
+      const signature = storedSignature(tc);
+      if (signature !== undefined) {
+        part.thoughtSignature = signature;
+      } else if (!signed && i === 0) {
+        // No call in this turn has a real signature: Gemini checks only the
+        // turn's first call, and Google documents this value for that case.
+        part.thoughtSignature = SKIP_THOUGHT_SIGNATURE;
+      }
+      parts.push(part);
+    });
   }
   if (parts.length === 0) parts.push({ text: '' });
   return parts;
+}
+
+/** The `thoughtSignature` this connector stored on a tool call, if any. Other providers' keys are never read. */
+function storedSignature(tc: ToolCall): string | undefined {
+  const signature = (tc.providerMetadata?.gemini as { thoughtSignature?: unknown } | undefined)?.thoughtSignature;
+  return typeof signature === 'string' && signature.length > 0 ? signature : undefined;
+}
+
+function signatureMetadata(p: GeminiPart): Record<string, unknown> | undefined {
+  return typeof p.thoughtSignature === 'string' && p.thoughtSignature.length > 0
+    ? { gemini: { thoughtSignature: p.thoughtSignature } }
+    : undefined;
+}
+
+/**
+ * Whether an id goes back on `functionCall.id` / `functionResponse.id`: any
+ * real id does — Gemini's own, and another provider's, which Gemini accepts
+ * as long as the call and its response carry the same one. Only an id this
+ * connector made up for a call Gemini returned without one stays off the wire.
+ */
+function isEchoableId(id: string): boolean {
+  return id.length > 0 && !SYNTHETIC_CALL_ID.test(id);
 }
 
 function isFunctionResponseParts(parts: unknown[]): boolean {
@@ -386,7 +478,8 @@ function applyResponseFormat(
     generationConfig.responseMimeType = 'application/json';
   } else if (rf.type === 'json_schema') {
     generationConfig.responseMimeType = 'application/json';
-    generationConfig.responseSchema = rf.jsonSchema.schema;
+    // JSON Schema proper; `responseSchema` takes only Google's OpenAPI subset.
+    generationConfig.responseJsonSchema = rf.jsonSchema.schema;
   }
 }
 
@@ -395,22 +488,34 @@ function mapFinishReason(fr: string | null | undefined): FinishReason {
     case 'STOP':
       return 'stop';
     case 'MAX_TOKENS':
+    case 'CONTINUATION':
       return 'length';
     case 'SAFETY':
     case 'RECITATION':
     case 'BLOCKLIST':
     case 'PROHIBITED_CONTENT':
     case 'SPII':
+    case 'IMAGE_SAFETY':
+    case 'IMAGE_PROHIBITED_CONTENT':
+    case 'IMAGE_RECITATION':
       return 'content_filter';
+    // MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, TOO_MANY_TOOL_CALLS,
+    // LANGUAGE (an unsupported language, not a safety block), NO_IMAGE,
+    // IMAGE_OTHER, OTHER, unspecified: no normalized counterpart (a malformed
+    // call is not a usable tool call).
     default:
       return 'unknown';
   }
 }
 
+/**
+ * Thoughts are billed as output and tool-use prompts as input, so both are
+ * folded in; Gemini's own total is the same sum.
+ */
 function mapUsage(u: GeminiResponse['usageMetadata']): Usage {
-  const inputTokens = u?.promptTokenCount ?? 0;
-  const outputTokens = u?.candidatesTokenCount ?? 0;
-  return { inputTokens, outputTokens, totalTokens: u?.totalTokenCount ?? inputTokens + outputTokens };
+  const inputTokens = (u?.promptTokenCount ?? 0) + (u?.toolUsePromptTokenCount ?? 0);
+  const outputTokens = (u?.candidatesTokenCount ?? 0) + (u?.thoughtsTokenCount ?? 0);
+  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
 }
 
 function effortBudget(effort: 'low' | 'medium' | 'high'): number {
@@ -468,22 +573,64 @@ function extractRetryDelaySeconds(body: unknown): number | null {
   return null;
 }
 
-/** HTTP status for a mid-stream Gemini `{"error": …}` frame — Gemini's `error.code` IS the HTTP status. */
-function errorFrameStatus(error: GeminiResponse['error']): number {
+/** HTTP status for each google.rpc status name a mid-stream error frame can carry. */
+const RPC_STATUS_HTTP: Record<string, number> = {
+  INVALID_ARGUMENT: 400,
+  FAILED_PRECONDITION: 400,
+  OUT_OF_RANGE: 400,
+  UNAUTHENTICATED: 401,
+  PERMISSION_DENIED: 403,
+  NOT_FOUND: 404,
+  ABORTED: 409,
+  ALREADY_EXISTS: 409,
+  RESOURCE_EXHAUSTED: 429,
+  CANCELLED: 499,
+  INTERNAL: 500,
+  UNKNOWN: 500,
+  DATA_LOSS: 500,
+  UNIMPLEMENTED: 501,
+  UNAVAILABLE: 503,
+  DEADLINE_EXCEEDED: 504,
+};
+
+/**
+ * The HTTP status a mid-stream Gemini `{"error": …}` frame stands for:
+ * `error.code` is the HTTP status; without a usable one, the google.rpc
+ * `error.status` name decides; `null` when the frame names neither.
+ */
+function errorFrameStatus(error: GeminiResponse['error']): number | null {
   const code = error?.code;
-  return typeof code === 'number' && code >= 400 && code <= 599 ? code : 500;
+  if (typeof code === 'number' && code >= 400 && code <= 599) return code;
+  const byName = typeof error?.status === 'string' ? RPC_STATUS_HTTP[error.status] : undefined;
+  return byName !== undefined && byName >= 400 && byName <= 599 ? byName : null;
 }
 
-function mapStatusToProviderCode(status: number, message: string): ProviderCode {
+function mapStatusToProviderCode(status: number, message: string, body: unknown): ProviderCode {
   if (status === 401 || status === 403) return 'auth_failed';
-  if (status === 429) return 'rate_limited';
-  if (status >= 500) return 'provider_unavailable';
-  if (status === 400 || status === 404 || status === 422) {
-    const msg = message.toLowerCase();
-    if (msg.includes('too long') || msg.includes('context') || msg.includes('token count')) {
+  // 402 is credit/quota exhaustion, which OpenAI (429 insufficient_quota) and
+  // Gemini (RESOURCE_EXHAUSTED) already report as rate-limited, and
+  // @thinwrap/notifications maps Pusher Beams' 402 the same way.
+  if (status === 429 || status === 402) return 'rate_limited';
+  if (status >= 500 || status === 408) return 'provider_unavailable';
+  if (status >= 400) {
+    // A bad key is a 400 INVALID_ARGUMENT whose ErrorInfo reason names it.
+    if (status === 400 && hasErrorReason(body, 'API_KEY_INVALID')) return 'auth_failed';
+    // Only the overflow message ("The input token count (N) exceeds the maximum
+    // number of tokens allowed (M)") counts: a looser match ("context", "too
+    // long") would also catch ordinary 400s, and a caller that trims history on
+    // this code would then loop forever.
+    if (status === 400 && message.toLowerCase().includes('exceeds the maximum number of tokens')) {
       return 'context_length_exceeded';
     }
+    // 404, 413, 422, …: the request cannot succeed as sent.
     return 'invalid_request';
   }
   return 'unknown';
+}
+
+/** Whether a google.rpc error body carries an `ErrorInfo` detail with this `reason`. */
+function hasErrorReason(body: unknown, reason: string): boolean {
+  const err = (body as { error?: { details?: unknown } } | null)?.error;
+  const details = err?.details;
+  return Array.isArray(details) && details.some((d) => (d as { reason?: unknown } | null)?.reason === reason);
 }
