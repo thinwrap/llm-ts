@@ -72,14 +72,20 @@ Touch-points, in order:
    - `README.md` — plain Markdown that opens directly with its `# Title` (no metadata block).
 4. **Dispatch** — add a `if (providerId === '<id>')` branch to [`src/facades/chat.facade.ts`](../src/facades/chat.facade.ts).
 5. **Export** — re-export the connector + config from [`src/index.ts`](../src/index.ts), the only public surface.
+6. **Budget** — add the connector to [`.size-limit.json`](../.size-limit.json) and give it a probe in [`scripts/check-tree-shaking.mjs`](../scripts/check-tree-shaking.mjs).
 
 ### Definition of done (the CI gates)
 
 ```bash
 npm run typecheck                     # strict; provider-id ↔ config-map ↔ facade must line up
 npm test                              # vitest — single file: npx vitest src/providers/<id>/<id>.connector.spec.ts
+npm run lint
 npm run build && npm run check:dist   # dual CJS/ESM emit + offline dual-entrypoint import smoke
+npm run size                          # per-entry gzip budget
 ```
+
+CI runs these across a Node 18/20/22/24/26 × Linux/macOS/Windows matrix, plus an offline (network-disabled)
+import smoke that proves zero import-time egress.
 
 ## Invariants you must not break
 

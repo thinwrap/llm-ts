@@ -34,7 +34,13 @@
     "check:dist": "node scripts/check-dist.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "size": "size-limit",
+    "size:why": "size-limit --why",
+    "check:tree-shaking": "node scripts/check-tree-shaking.mjs"
   },
   "keywords": [
     "llm",
@@ -65,8 +71,15 @@
   },
   "license": "MIT",
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@size-limit/preset-small-lib": "^11.2.0",
     "@types/node": "^20.19.41",
+    "@vitest/coverage-v8": "^3.2.4",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.39.4",
+    "size-limit": "^11.2.0",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.59.3",
     "vite": "^6.4.3",
     "vitest": "^3.2.4"
   }

@@ -1,0 +1,10 @@
+[
+  { "name": "openai-compat",     "path": "dist/esm/index.js", "import": "{ OpenAICompatConnector }",           "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "openai-compat-emb", "path": "dist/esm/index.js", "import": "{ OpenAICompatEmbeddingsConnector }", "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "anthropic",         "path": "dist/esm/index.js", "import": "{ AnthropicConnector }",              "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "bedrock",           "path": "dist/esm/index.js", "import": "{ BedrockConnector }",                "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "gemini",            "path": "dist/esm/index.js", "import": "{ GeminiConnector }",                 "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "chat-facade",       "path": "dist/esm/index.js", "import": "{ Chat }",                            "limit": "16 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "embeddings-facade", "path": "dist/esm/index.js", "import": "{ Embeddings }",                      "limit": "8 KB",  "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] },
+  { "name": "all",               "path": "dist/esm/index.js", "import": "*",                                   "limit": "16 KB", "gzip": true, "ignore": ["crypto", "node:crypto", "url", "node:url", "querystring", "node:querystring"] }
+]

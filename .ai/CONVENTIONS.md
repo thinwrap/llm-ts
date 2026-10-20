@@ -73,9 +73,12 @@ complete and at parity with the sibling-language libraries.
 
 - `tsconfig.json` is `strict: true` with `noUncheckedIndexedAccess`. Target ES2021, lib ES2022.
 - `npm run typecheck` (`tsc --noEmit`) clean is the canary for any connector change.
+- ESLint flat config (`eslint.config.mjs`) with `typescript-eslint`. Key rules:
+  `consistent-type-imports: error`, `no-explicit-any: warn`.
 - Dual build → `dist/cjs/` (CommonJS) + `dist/esm/` (ES2020). `scripts/fix-esm-imports.mjs` adds
   `.js` specifiers to the ESM emit (source imports are extensionless); `npm run check:dist`
   import-smokes both entrypoints the way Node loads them. Source/declaration maps are excluded from
   the build (tarball size).
 - **`vite` is pinned to `^6` and `vitest` to `^3` — do not bump** (Node 18 floor; Vite 7 / Vitest 4
-  dropped Node 18). Revisit at the umbrella-wide v2 cutover (ESM-only + Node ≥22).
+  dropped Node 18). Revisit at the umbrella-wide v2 cutover (ESM-only + Node ≥22). The same holds
+  for ESLint 10 and size-limit 12; `.github/dependabot.yml` holds all of these majors back.

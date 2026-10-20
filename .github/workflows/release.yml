@@ -2,17 +2,13 @@ name: Publish to npm
 
 # OIDC publish-to-npm with Sigstore provenance.
 #
-# Publish job is inlined (not delegated to an external reusable workflow) so
-# the full publish path is auditable in this repo — same design proven by
-# @thinwrap/location and @thinwrap/notifications. Sigstore attests the workflow
-# source; OIDC trusted publishing means no NPM_TOKEN is consumed. The npm
-# trusted publisher for @thinwrap/llm must reference THIS filename (release.yml).
-#
-# NOTE (first release): npm can only attach a trusted publisher to a package
-# that already exists, so the very first publish is a one-time manual bootstrap
-# (`npm publish --provenance=false --access public` after `npm run build`).
-# Configure the trusted publisher on npmjs.com immediately after, and every
-# subsequent `v*.*.*` tag publishes through this workflow with provenance.
+# The publish job is inlined (not delegated to an external reusable workflow)
+# so the full publish path is auditable in this repo. Sigstore attests the
+# workflow source; OIDC trusted publishing means no NPM_TOKEN is consumed. The
+# npm trusted publisher for @thinwrap/llm must reference THIS filename
+# (release.yml) — renaming the file breaks publishing. Two-factor
+# authentication on the npm publishing account is a manual precondition of
+# tagging.
 #
 # Trigger: push of a `v*.*.*` tag. Branch protection does not cover tags, so
 # the job refuses to publish unless the tagged commit is on `main`.
@@ -79,8 +75,9 @@ jobs:
 
       # --ignore-scripts: this job holds `id-token: write`, so a dependency's
       # install script must not run here. Nothing needs one: the package has no
-      # runtime deps, the build is plain tsc, and esbuild (via vitest) resolves
-      # its platform binary from the optional dependency without its postinstall.
+      # runtime deps, the build is plain tsc, and esbuild (via vitest and
+      # size-limit) resolves its platform binary from the optional dependency
+      # without its postinstall.
       - run: npm ci --ignore-scripts --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=3 --fetch-retry-maxtimeout=15000
         timeout-minutes: 8
 
@@ -88,11 +85,15 @@ jobs:
 
       - run: npm test
 
+      - run: npm run lint
+
       - run: npm run build
 
       # Plain-Node import smoke of dist (CJS + ESM) — catches broken emits
       # that bundler-resolution steps cannot.
       - run: npm run check:dist
+
+      - run: npm run size
 
       - name: Publish to npm with Sigstore provenance
         run: npm publish --provenance --access public
